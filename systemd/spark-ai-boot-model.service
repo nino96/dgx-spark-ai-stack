@@ -1,0 +1,13 @@
+[Unit]
+Description=spark-ai-stack boot model
+Wants=spark-ai-core.service
+After=spark-ai-core.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=%h/code/spark-ai-stack/bin/modelctl ensure-boot
+TimeoutStartSec=1800
+
+[Install]
+WantedBy=default.target

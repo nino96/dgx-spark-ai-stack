@@ -1,0 +1,327 @@
+#!/usr/bin/env python3
+"""Read-only host, artifact, network, and service diagnostics."""
+
+from __future__ import annotations
+
+import argparse
+import hashlib
+import json
+import os
+from pathlib import Path
+import re
+import shutil
+import stat
+import subprocess
+import sys
+from typing import Any
+import urllib.error
+import urllib.request
+
+
+ROOT = Path(__file__).resolve().parents[1]
+DATA_ROOT = Path(os.environ.get("SPARK_AI_DATA_ROOT", "~/ai-data")).expanduser()
+SECRETS_FILE = Path(
+    os.environ.get(
+        "SPARK_AI_SECRETS_FILE", "~/.config/spark-ai-stack/secrets.env"
+    )
+).expanduser()
+LOCKS = json.loads((ROOT / "config" / "versions.lock.yaml").read_text())
+SERVICE_PORTS = {4000, 8001, 8002, 8003, 8888}
+
+
+def command(
+    arguments: list[str], timeout: int = 20
+) -> subprocess.CompletedProcess[str]:
+    try:
+        return subprocess.run(
+            arguments, text=True, capture_output=True, timeout=timeout, check=False
+        )
+    except (OSError, subprocess.TimeoutExpired) as error:
+        return subprocess.CompletedProcess(arguments, 127, "", str(error))
+
+
+def read(path: str) -> str:
+    try:
+        return Path(path).read_text(encoding="utf-8", errors="replace").strip()
+    except OSError:
+        return ""
+
+
+def meminfo() -> dict[str, int]:
+    result: dict[str, int] = {}
+    for line in read("/proc/meminfo").splitlines():
+        key, raw = line.split(":", 1)
+        fields = raw.strip().split()
+        if fields and fields[0].isdigit():
+            result[key] = int(fields[0]) * 1024
+    return result
+
+
+def probe_url(url: str, headers: dict[str, str] | None = None) -> int | None:
+    request = urllib.request.Request(url, headers=headers or {})
+    try:
+        with urllib.request.urlopen(request, timeout=2) as response:
+            return response.status
+    except urllib.error.HTTPError as error:
+        return error.code
+    except (urllib.error.URLError, TimeoutError):
+        return None
+
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--full", action="store_true", help="include expensive runtime/artifact tests")
+    parser.add_argument("--verify-images", action="store_true", help="verify the LiteLLM cosign signature")
+    parser.add_argument("--json", action="store_true")
+    return parser.parse_args()
+
+
+def main() -> int:
+    args = parse_args()
+    results: list[dict[str, Any]] = []
+
+    def add(name: str, ok: bool, detail: str, severity: str = "error") -> None:
+        results.append(
+            {"name": name, "ok": bool(ok), "detail": detail, "severity": severity}
+        )
+
+    arch = os.uname().machine
+    add("architecture", arch == "aarch64", arch)
+
+    vendor = read("/sys/class/dmi/id/sys_vendor")
+    product = read("/sys/class/dmi/id/product_name")
+    asus = "ASUSTeK" in vendor and "GX10" in product
+    nvidia = "NVIDIA" in vendor and "DGX" in product and "Spark" in product
+    add("supported_dmi", asus or nvidia, f"{vendor} {product}".strip())
+
+    dgx_release = read("/etc/dgx-release")
+    safe_dgx_fields = (
+        "DGX_NAME=",
+        "DGX_SWBUILD_VERSION=",
+        "DGX_PLATFORM=",
+        "DGX_OTA_VERSION=",
+    )
+    dgx_summary = " | ".join(
+        line for line in dgx_release.splitlines() if line.startswith(safe_dgx_fields)
+    )
+    add(
+        "dgx_release",
+        bool(dgx_release) and "DGX" in dgx_release.upper(),
+        dgx_summary or "missing",
+    )
+
+    os_release = read("/etc/os-release")
+    ubuntu_24 = 'ID=ubuntu' in os_release and re.search(r'VERSION_ID="?24\.04', os_release)
+    add("ubuntu_24_04", bool(ubuntu_24), next((line for line in os_release.splitlines() if line.startswith("PRETTY_NAME=")), "unknown"))
+
+    info = meminfo()
+    total_gib = info.get("MemTotal", 0) / 1024**3
+    available_gib = info.get("MemAvailable", 0) / 1024**3
+    add("unified_memory", total_gib >= 118, f"total={total_gib:.1f} GiB available={available_gib:.1f} GiB")
+
+    disk_path = DATA_ROOT if DATA_ROOT.exists() else Path.home()
+    free_gib = shutil.disk_usage(disk_path).free / 1024**3
+    add("disk_free", free_gib >= 150, f"{free_gib:.1f} GiB at {disk_path}", "warning")
+
+    smi = command(["nvidia-smi", "--query-gpu=name,compute_cap", "--format=csv,noheader"])
+    gpu_detail = (smi.stdout or smi.stderr).strip()
+    add("gb10_compute", smi.returncode == 0 and ("12.1" in gpu_detail or "GB10" in gpu_detail), gpu_detail or "nvidia-smi failed")
+
+    nvcc = command(["nvcc", "--version"])
+    cuda_detail = (nvcc.stdout or nvcc.stderr).strip().splitlines()
+    cuda_text = " | ".join(cuda_detail[-2:])
+    add("cuda_13", nvcc.returncode == 0 and "release 13." in nvcc.stdout, cuda_text or "nvcc failed")
+
+    for executable in ["docker", "tailscale", "git", "cmake", "openssl"]:
+        path = shutil.which(executable)
+        add(f"command_{executable}", bool(path), path or "missing")
+
+    docker = command(["docker", "info"])
+    add("docker_daemon", docker.returncode == 0, (docker.stderr or "reachable").strip())
+    compose = command(["docker", "compose", "version"])
+    add("docker_compose", compose.returncode == 0, (compose.stdout or compose.stderr).strip())
+
+    toolkit = command(["nvidia-ctk", "--version"])
+    add("nvidia_container_toolkit", toolkit.returncode == 0, (toolkit.stdout or toolkit.stderr).strip())
+
+    tailscale = command(["tailscale", "status", "--json"])
+    add("tailscale_connected", tailscale.returncode == 0, "connected" if tailscale.returncode == 0 else tailscale.stderr.strip())
+
+    if SECRETS_FILE.exists():
+        mode = stat.S_IMODE(SECRETS_FILE.stat().st_mode)
+        add("secrets_mode", mode == 0o600, f"{SECRETS_FILE} mode={mode:04o}")
+        content = SECRETS_FILE.read_text(encoding="utf-8")
+        required = all(
+            re.search(rf"^{key}=.+$", content, re.MULTILINE)
+            for key in ("LITELLM_MASTER_KEY", "SEARXNG_SECRET")
+        )
+        add("secrets_required_values", required, "required values set" if required else "missing/empty required value")
+    else:
+        add("secrets_file", False, f"missing: {SECRETS_FILE}")
+
+    pinned = [
+        entry["reference"]
+        for entry in LOCKS["images"].values()
+        if "reference" in entry
+    ]
+    add("image_digests", all("@sha256:" in reference for reference in pinned), ", ".join(pinned))
+    add(
+        "image_platform_locks",
+        all(entry.get("platform") == "linux/arm64" for entry in LOCKS["images"].values()),
+        ", ".join(
+            f"{name}={entry.get('platform', 'missing')}"
+            for name, entry in LOCKS["images"].items()
+        ),
+    )
+
+    listeners = command(["ss", "-H", "-lnt"])
+    exposed: list[str] = []
+    for line in listeners.stdout.splitlines():
+        fields = line.split()
+        if len(fields) < 4:
+            continue
+        local = fields[3]
+        match = re.search(r":(\d+)$", local)
+        if not match or int(match.group(1)) not in SERVICE_PORTS:
+            continue
+        host = local[: match.start()]
+        if host in {"0.0.0.0", "*", "[::]", "::"}:
+            exposed.append(local)
+    add("loopback_boundary", not exposed, "no wildcard listeners" if not exposed else ", ".join(exposed))
+
+    gateway_status = probe_url("http://127.0.0.1:4000/v1/models")
+    if gateway_status is not None:
+        add("gateway_rejects_missing_key", gateway_status == 401, f"HTTP {gateway_status}")
+    search_status = probe_url("http://127.0.0.1:8888/search/?q=health&format=json")
+    if search_status is not None:
+        add("searxng_health", search_status == 200, f"HTTP {search_status}")
+
+    if args.verify_images or args.full:
+        cosign = shutil.which("cosign")
+        add("cosign_installed", bool(cosign), cosign or "missing")
+        image = LOCKS["images"]["litellm"]
+        public_key = Path(image["public_key_path"])
+        public_key_digest = (
+            hashlib.sha256(public_key.read_bytes()).hexdigest()
+            if public_key.is_file()
+            else "missing"
+        )
+        key_ok = public_key_digest == image["public_key_sha256"]
+        add("litellm_public_key", key_ok, f"{public_key}: {public_key_digest}")
+        if cosign and key_ok:
+            verified = command(
+                [
+                    cosign,
+                    "verify",
+                    "--key",
+                    image["public_key_path"],
+                    image["release_index_reference"],
+                ],
+                timeout=120,
+            )
+            add("litellm_signature", verified.returncode == 0, (verified.stderr or verified.stdout)[-1000:].strip())
+            signed_index = command(
+                [
+                    "docker",
+                    "buildx",
+                    "imagetools",
+                    "inspect",
+                    "--raw",
+                    image["release_index_reference"],
+                ],
+                timeout=120,
+            )
+            deployed_digest = image["reference"].rsplit("@", 1)[-1]
+            add(
+                "litellm_signed_index_member",
+                signed_index.returncode == 0
+                and deployed_digest in signed_index.stdout,
+                deployed_digest,
+            )
+
+    if args.full:
+        for image_name, image in LOCKS["images"].items():
+            inspected = command(
+                [
+                    "docker",
+                    "image",
+                    "inspect",
+                    "--format",
+                    "{{.Architecture}}",
+                    image["reference"],
+                ],
+                timeout=120,
+            )
+            add(
+                f"arm64_image_{image_name}",
+                inspected.returncode == 0 and inspected.stdout.strip() == "arm64",
+                (inspected.stderr or inspected.stdout).strip(),
+            )
+
+        gpu_image = LOCKS["images"]["vllm_base"]["reference"]
+        gpu = command(
+            ["docker", "run", "--rm", "--gpus", "all", "--entrypoint", "nvidia-smi", gpu_image],
+            timeout=120,
+        )
+        add("gpu_container", gpu.returncode == 0, (gpu.stderr or gpu.stdout)[-1000:].strip())
+
+        fastapi = command(
+            [
+                "docker",
+                "run",
+                "--rm",
+                "--entrypoint",
+                "python3",
+                "local/spark-ai-vllm:26.06-fastapi136",
+                "-c",
+                "import fastapi; print(fastapi.__version__)",
+            ],
+            timeout=120,
+        )
+        fastapi_version = fastapi.stdout.strip()
+        add(
+            "vllm_fastapi_pin",
+            fastapi.returncode == 0
+            and fastapi_version == LOCKS["python"]["fastapi_workaround"],
+            (fastapi.stderr or fastapi.stdout)[-1000:].strip(),
+        )
+
+        verification = command([str(ROOT / "bin" / "modelctl"), "verify", "all", "--json"], timeout=3600)
+        add("model_artifacts", verification.returncode == 0, (verification.stderr or verification.stdout)[-2000:].strip())
+
+        llama_binary = DATA_ROOT / "builds" / "llama.cpp" / "bin" / "llama-server"
+        add("llama_sm121_binary", os.access(llama_binary, os.X_OK), str(llama_binary))
+        llama_cache = DATA_ROOT / "builds" / "llama.cpp" / "CMakeCache.txt"
+        llama_cache_text = read(str(llama_cache))
+        add(
+            "llama_sm121_configuration",
+            "CMAKE_CUDA_ARCHITECTURES:STRING=121" in llama_cache_text,
+            str(llama_cache),
+        )
+        ds4_binary = DATA_ROOT / "src" / "ds4" / "ds4-server"
+        add("ds4_cuda_binary", os.access(ds4_binary, os.X_OK), str(ds4_binary))
+        ds4_stamp = DATA_ROOT / "src" / "ds4" / ".spark-ai-build-commit"
+        ds4_commit = LOCKS["sources"]["ds4"]["commit"]
+        add("ds4_cuda_build_stamp", read(str(ds4_stamp)) == ds4_commit, str(ds4_stamp))
+
+        for unit in ("spark-ai-core.service", "spark-ai-boot-model.service"):
+            enabled = command(["systemctl", "--user", "is-enabled", unit])
+            add(f"enabled_{unit}", enabled.returncode == 0, (enabled.stdout or enabled.stderr).strip())
+
+    failures = [
+        result
+        for result in results
+        if not result["ok"] and result["severity"] == "error"
+    ]
+    if args.json:
+        print(json.dumps({"ok": not failures, "checks": results}, indent=2, sort_keys=True))
+    else:
+        for result in results:
+            marker = "PASS" if result["ok"] else ("WARN" if result["severity"] == "warning" else "FAIL")
+            print(f"{marker:<4} {result['name']:<30} {result['detail']}")
+        print(f"\n{len(results) - len(failures)}/{len(results)} checks without fatal errors.")
+    return 1 if failures else 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

@@ -1,0 +1,80 @@
+{
+  "schema": 1,
+  "generated": "2026-08-06",
+  "sources": {
+    "ds4": {
+      "repository": "https://github.com/Entrpi/ds4.git",
+      "ref": "v0.5.2",
+      "commit": "82d2a6f7ec580d979f8352d3249ad5415a321e89"
+    },
+    "llama_cpp": {
+      "repository": "https://github.com/ggml-org/llama.cpp.git",
+      "ref": "b10289",
+      "commit": "f9e832c10e9444cb168ddcb579cc62c154f3068b"
+    }
+  },
+  "images": {
+    "litellm": {
+      "reference": "ghcr.io/berriai/litellm:v1.86.2@sha256:c0fded5fc397836c9f75220f3a3cacf8dca1525be8b474b068233afd3fe6e8f1",
+      "platform": "linux/arm64",
+      "release_index_reference": "ghcr.io/berriai/litellm:v1.86.2@sha256:cae1ac3492d6d0bea69c26f4485381624e073eb753f3534ae7703a4204a4ce6b",
+      "public_key_url": "https://raw.githubusercontent.com/BerriAI/litellm/0112e53046018d726492c814b3644b7d376029d0/cosign.pub",
+      "public_key_sha256": "ff8869bf14ba9d10af7b64b9d479543b44daec0165e715753c43ff8a998f6dd3",
+      "public_key_path": "/usr/local/share/spark-ai-stack/litellm-cosign.pub"
+    },
+    "vllm_base": {
+      "reference": "nvcr.io/nvidia/vllm:26.06-py3@sha256:47539d1e9a826506a1ff4536fe507d7688d453c07fe8a2325e96bcc9556b279a",
+      "platform": "linux/arm64",
+      "release_index_reference": "nvcr.io/nvidia/vllm:26.06-py3@sha256:6e537fc8d84beb9b60e789236168141d2ef4420bc28cbb85ec7d4318ca918b6c"
+    },
+    "searxng": {
+      "reference": "docker.io/searxng/searxng:2026.7.3@sha256:a27984e88335cc72263509cec1173d27e58b63dbf99b438b7faa96c6c306c0c7",
+      "platform": "linux/arm64",
+      "release_index_reference": "docker.io/searxng/searxng:2026.7.3@sha256:b7492e1b8fcb376191809982e6a45dc809a5d0e641d81feaa53a1fac6c599b9e"
+    }
+  },
+  "tools": {
+    "cosign": {
+      "version": "3.0.6",
+      "url": "https://github.com/sigstore/cosign/releases/download/v3.0.6/cosign-linux-arm64",
+      "sha256": "bedac92e8c3729864e13d4a17048007cfafa79d5deca993a43a90ffe018ef2b8"
+    }
+  },
+  "python": {
+    "fastapi_workaround": "0.136.3",
+    "ansible_core": "2.18.7",
+    "huggingface_hub": "0.36.0"
+  },
+  "models": {
+    "nvidia_qwen": {
+      "repository": "nvidia/Qwen3.6-35B-A3B-NVFP4",
+      "revision": "491c2f1ea524c639598bf8fa787a93fed5a6fbce"
+    },
+    "unsloth_qwen_candidate": {
+      "repository": "unsloth/Qwen3.6-35B-A3B-NVFP4-Fast",
+      "revision": "1c3f884bc99aac2524f6d49bcbac8c88401afd66",
+      "enabled": false
+    },
+    "qwen_gguf": {
+      "repository": "bartowski/Qwen_Qwen3.5-4B-GGUF",
+      "revision": "4168f45a16a1290d65a4ec0fa312ae917a4c15d6",
+      "filename": "Qwen_Qwen3.5-4B-Q4_K_M.gguf",
+      "size": 3013027808,
+      "sha256": "13c16f426047e2de38cd075bdade4a7bcbc8c774384876f677740cda65f8a983"
+    },
+    "ds4_base": {
+      "repository": "antirez/deepseek-v4-gguf",
+      "revision": "e7f04037032990db0346398d249baf9fb9df1ccc",
+      "filename": "DeepSeek-V4-Flash-IQ2XXS-w2Q2K-AProjQ8-SExpQ8-OutQ8-chat-v2-imatrix-0731.gguf",
+      "size": 86720111488,
+      "sha256": "ca22ae2f838e14077c22bc1c1417b71b45b5e5a3687bd96c2ac6e17fdb6261c0"
+    },
+    "ds4_drafter": {
+      "repository": "bleysg/DeepSeek-V4-Flash-DSpark-drafter-GGUF",
+      "revision": "81c6fdd38f9582da45ba27f0ed7b63bcd3ea3b62",
+      "filename": "DSpark-drafter-Q2K-Q8-0731.gguf",
+      "size": 6971241504,
+      "sha256": "8fa269560dc76fd73e4233ad9b1938b5f65dd363381fd9b1a5c6183f7d12d686"
+    }
+  }
+}

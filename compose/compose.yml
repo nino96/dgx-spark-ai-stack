@@ -1,0 +1,102 @@
+name: spark-ai-stack
+
+services:
+  litellm:
+    image: ghcr.io/berriai/litellm:v1.86.2@sha256:c0fded5fc397836c9f75220f3a3cacf8dca1525be8b474b068233afd3fe6e8f1
+    container_name: spark-ai-litellm
+    network_mode: host
+    restart: unless-stopped
+    env_file:
+      - ${SPARK_AI_DATA_ROOT:-${HOME}/ai-data}/state/litellm.env
+    environment:
+      LITELLM_LOG: INFO
+    volumes:
+      - ${SPARK_AI_DATA_ROOT:-${HOME}/ai-data}/state/litellm-config.yaml:/app/config.yaml:ro
+    command:
+      - --config
+      - /app/config.yaml
+      - --host
+      - 127.0.0.1
+      - --port
+      - "4000"
+    security_opt:
+      - no-new-privileges:true
+
+  searxng:
+    image: docker.io/searxng/searxng:2026.7.3@sha256:a27984e88335cc72263509cec1173d27e58b63dbf99b438b7faa96c6c306c0c7
+    container_name: spark-ai-searxng
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:8888:8080"
+    env_file:
+      - ${SPARK_AI_DATA_ROOT:-${HOME}/ai-data}/state/searxng.env
+    volumes:
+      - ${SPARK_AI_DATA_ROOT:-${HOME}/ai-data}/state/searxng-settings.yml:/etc/searxng/settings.yml:ro
+      - ${SPARK_AI_DATA_ROOT:-${HOME}/ai-data}/cache/searxng:/var/cache/searxng
+    security_opt:
+      - no-new-privileges:true
+
+  vllm:
+    profiles: [models]
+    build:
+      context: ./vllm
+      args:
+        BASE_IMAGE: nvcr.io/nvidia/vllm:26.06-py3@sha256:47539d1e9a826506a1ff4536fe507d7688d453c07fe8a2325e96bcc9556b279a
+        FASTAPI_VERSION: 0.136.3
+    image: local/spark-ai-vllm:26.06-fastapi136
+    container_name: spark-ai-vllm
+    restart: unless-stopped
+    ipc: host
+    ports:
+      - "127.0.0.1:8001:8000"
+    env_file:
+      - ${SPARK_AI_DATA_ROOT:-${HOME}/ai-data}/state/vllm.env
+    environment:
+      HF_HOME: /hf-cache
+      HF_HUB_CACHE: /hf-cache/hub
+    volumes:
+      - ${SPARK_AI_DATA_ROOT:-${HOME}/ai-data}/huggingface:/hf-cache
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+    command:
+      - vllm
+      - serve
+      - nvidia/Qwen3.6-35B-A3B-NVFP4
+      - --revision
+      - 491c2f1ea524c639598bf8fa787a93fed5a6fbce
+      - --served-model-name
+      - qwen3.6-35b
+      - --host
+      - 0.0.0.0
+      - --port
+      - "8000"
+      - --tensor-parallel-size
+      - "1"
+      - --kv-cache-dtype
+      - fp8
+      - --calculate-kv-scales
+      - --attention-backend
+      - flashinfer
+      - --moe-backend
+      - marlin
+      - --gpu-memory-utilization
+      - "0.60"
+      - --max-model-len
+      - "262144"
+      - --max-num-seqs
+      - "4"
+      - --max-num-batched-tokens
+      - "8192"
+      - --enable-prefix-caching
+      - --reasoning-parser
+      - qwen3
+      - --enable-auto-tool-choice
+      - --tool-call-parser
+      - qwen3_coder
+    security_opt:
+      - no-new-privileges:true

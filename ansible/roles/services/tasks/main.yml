@@ -1,0 +1,171 @@
+---
+- name: Check secrets file
+  ansible.builtin.stat:
+    path: "{{ spark_ai_home }}/.config/spark-ai-stack/secrets.env"
+  register: secrets_file
+
+- name: Require initialized mode-0600 secrets
+  ansible.builtin.assert:
+    that:
+      - secrets_file.stat.exists
+      - secrets_file.stat.mode == '0600'
+    fail_msg: "Run bin/stack secrets-init before bin/stack apply."
+
+- name: Install systemd user units
+  ansible.builtin.copy:
+    src: "{{ spark_ai_repo }}/systemd/{{ item }}"
+    dest: "{{ spark_ai_home }}/.config/systemd/user/{{ item }}"
+    remote_src: true
+    owner: "{{ spark_ai_user }}"
+    mode: "0644"
+  loop:
+    - spark-ai-core.service
+    - spark-ai-boot-model.service
+    - spark-ai-llama.service
+    - spark-ai-ds4.service
+  register: installed_units
+
+- name: Initialize model and gateway state
+  ansible.builtin.command:
+    argv: ["{{ spark_ai_repo }}/bin/modelctl", init]
+  become: true
+  become_user: "{{ spark_ai_user }}"
+  environment:
+    HOME: "{{ spark_ai_home }}"
+    XDG_RUNTIME_DIR: "/run/user/{{ ansible_user_uid }}"
+  changed_when: false
+
+- name: Render least-privilege runtime environment files
+  ansible.builtin.command:
+    argv: ["{{ spark_ai_repo }}/bin/stack", render-config]
+  become: true
+  become_user: "{{ spark_ai_user }}"
+  environment:
+    HOME: "{{ spark_ai_home }}"
+  changed_when: false
+
+- name: Pull pinned core service images before cutover
+  ansible.builtin.command:
+    argv:
+      - docker
+      - compose
+      - --project-name
+      - spark-ai-stack
+      - --project-directory
+      - "{{ spark_ai_repo }}/compose"
+      - --file
+      - "{{ spark_ai_repo }}/compose/compose.yml"
+      - pull
+      - litellm
+      - searxng
+  become: true
+  become_user: "{{ spark_ai_user }}"
+  environment:
+    HOME: "{{ spark_ai_home }}"
+  changed_when: false
+
+- name: Build the pinned vLLM compatibility image
+  ansible.builtin.command:
+    argv:
+      - docker
+      - compose
+      - --project-name
+      - spark-ai-stack
+      - --project-directory
+      - "{{ spark_ai_repo }}/compose"
+      - --file
+      - "{{ spark_ai_repo }}/compose/compose.yml"
+      - build
+      - vllm
+  become: true
+  become_user: "{{ spark_ai_user }}"
+  environment:
+    HOME: "{{ spark_ai_home }}"
+  changed_when: false
+
+- name: Verify signed LiteLLM release index with the pinned public key
+  ansible.builtin.command:
+    argv:
+      - cosign
+      - verify
+      - --key
+      - /usr/local/share/spark-ai-stack/litellm-cosign.pub
+      - ghcr.io/berriai/litellm:v1.86.2@sha256:cae1ac3492d6d0bea69c26f4485381624e073eb753f3534ae7703a4204a4ce6b
+  changed_when: false
+
+- name: Inspect the signed LiteLLM release index
+  ansible.builtin.command:
+    argv:
+      - docker
+      - buildx
+      - imagetools
+      - inspect
+      - --raw
+      - ghcr.io/berriai/litellm:v1.86.2@sha256:cae1ac3492d6d0bea69c26f4485381624e073eb753f3534ae7703a4204a4ce6b
+  register: litellm_signed_index
+  changed_when: false
+
+- name: Require the deployed ARM64 LiteLLM manifest in the signed index
+  ansible.builtin.assert:
+    that:
+      - "'sha256:c0fded5fc397836c9f75220f3a3cacf8dca1525be8b474b068233afd3fe6e8f1' in litellm_signed_index.stdout"
+    fail_msg: "The pinned LiteLLM ARM64 manifest is not a member of the signed release index."
+
+- name: Inspect old SearXNG container after replacement image is ready
+  ansible.builtin.command: docker inspect searxng
+  register: old_searxng
+  changed_when: false
+  failed_when: false
+
+- name: Stop old SearXNG immediately before loopback cutover
+  ansible.builtin.command: docker stop searxng
+  when: >-
+    old_searxng.rc == 0 and
+    '"Running": true' in old_searxng.stdout
+  changed_when: true
+
+- name: Reload user service manager
+  ansible.builtin.systemd_service:
+    scope: user
+    daemon_reload: true
+  become: true
+  become_user: "{{ spark_ai_user }}"
+  environment:
+    XDG_RUNTIME_DIR: "/run/user/{{ ansible_user_uid }}"
+  when: installed_units.changed
+
+- name: Enable and start core services
+  ansible.builtin.systemd_service:
+    name: spark-ai-core.service
+    scope: user
+    enabled: true
+    state: started
+  become: true
+  become_user: "{{ spark_ai_user }}"
+  environment:
+    HOME: "{{ spark_ai_home }}"
+    XDG_RUNTIME_DIR: "/run/user/{{ ansible_user_uid }}"
+
+- name: Enable boot-model restoration without forcing a first download
+  ansible.builtin.systemd_service:
+    name: spark-ai-boot-model.service
+    scope: user
+    enabled: true
+  become: true
+  become_user: "{{ spark_ai_user }}"
+  environment:
+    HOME: "{{ spark_ai_home }}"
+    XDG_RUNTIME_DIR: "/run/user/{{ ansible_user_uid }}"
+
+- name: Keep manual native model units disabled at boot
+  ansible.builtin.systemd_service:
+    name: "{{ item }}"
+    scope: user
+    enabled: false
+  become: true
+  become_user: "{{ spark_ai_user }}"
+  environment:
+    XDG_RUNTIME_DIR: "/run/user/{{ ansible_user_uid }}"
+  loop:
+    - spark-ai-llama.service
+    - spark-ai-ds4.service

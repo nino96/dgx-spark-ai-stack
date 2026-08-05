@@ -1,0 +1,49 @@
+{
+  "schema": 1,
+  "boot_model": "qwen3.6-35b",
+  "normal_default": "qwen3.6-35b",
+  "models": {
+    "qwen3.6-35b": {
+      "runtime": "vllm",
+      "service": "vllm",
+      "source": "nvidia/Qwen3.6-35B-A3B-NVFP4",
+      "revision": "491c2f1ea524c639598bf8fa787a93fed5a6fbce",
+      "api_base": "http://127.0.0.1:8001/v1",
+      "health_url": "http://127.0.0.1:8001/v1/models",
+      "memory_budget_gib": 72,
+      "exclusive": false,
+      "boot": true
+    },
+    "qwen3.5-4b-gguf": {
+      "runtime": "llama_cpp",
+      "service": "spark-ai-llama.service",
+      "source": "bartowski/Qwen_Qwen3.5-4B-GGUF",
+      "revision": "4168f45a16a1290d65a4ec0fa312ae917a4c15d6",
+      "filename": "Qwen_Qwen3.5-4B-Q4_K_M.gguf",
+      "sha256": "13c16f426047e2de38cd075bdade4a7bcbc8c774384876f677740cda65f8a983",
+      "api_base": "http://127.0.0.1:8002/v1",
+      "health_url": "http://127.0.0.1:8002/v1/models",
+      "memory_budget_gib": 6,
+      "exclusive": false,
+      "boot": false
+    },
+    "deepseek-v4-flash": {
+      "runtime": "ds4",
+      "service": "spark-ai-ds4.service",
+      "source": "antirez/deepseek-v4-gguf",
+      "revision": "e7f04037032990db0346398d249baf9fb9df1ccc",
+      "filename": "DeepSeek-V4-Flash-IQ2XXS-w2Q2K-AProjQ8-SExpQ8-OutQ8-chat-v2-imatrix-0731.gguf",
+      "sha256": "ca22ae2f838e14077c22bc1c1417b71b45b5e5a3687bd96c2ac6e17fdb6261c0",
+      "drafter_source": "bleysg/DeepSeek-V4-Flash-DSpark-drafter-GGUF",
+      "drafter_revision": "81c6fdd38f9582da45ba27f0ed7b63bcd3ea3b62",
+      "drafter_filename": "DSpark-drafter-Q2K-Q8-0731.gguf",
+      "drafter_sha256": "8fa269560dc76fd73e4233ad9b1938b5f65dd363381fd9b1a5c6183f7d12d686",
+      "api_base": "http://127.0.0.1:8003/v1",
+      "health_url": "http://127.0.0.1:8003/v1/models",
+      "memory_budget_gib": 109,
+      "exclusive": true,
+      "boot": false,
+      "restore_on_deactivate": "qwen3.6-35b"
+    }
+  }
+}

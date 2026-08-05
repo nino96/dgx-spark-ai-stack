@@ -1,0 +1,50 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+execute=0
+confirmed=0
+for argument in "$@"; do
+    case "$argument" in
+        --execute) execute=1 ;;
+        --i-confirm-parity) confirmed=1 ;;
+        -h|--help)
+            cat <<'EOF'
+Usage: bin/cleanup-legacy [--execute --i-confirm-parity]
+
+Dry-runs by default. The execute mode only disables/stops known legacy
+services. It does not delete models, source, Docker images, containers, or
+volumes. Run it only after API parity and reboot verification.
+EOF
+            exit 0
+            ;;
+        *) echo "cleanup-legacy: unknown option: $argument" >&2; exit 2 ;;
+    esac
+done
+
+cat <<'EOF'
+Legacy retirement scope:
+  systemd user unit: ds4-server.service (disable and stop)
+  Docker container: vllm-server (stop only)
+  Docker container: searxng (stop only)
+
+Retained:
+  ~/Documents, ~/code/ds4, ~/code/ds4-on-spark, ~/gguf
+  vllm-hf-cache, all Docker images, and all stopped containers
+EOF
+
+if [[ "$execute" -ne 1 ]]; then
+    echo "Dry run only. Nothing changed."
+    exit 0
+fi
+if [[ "$confirmed" -ne 1 ]]; then
+    echo "cleanup-legacy: --execute also requires --i-confirm-parity" >&2
+    exit 2
+fi
+
+systemctl --user disable --now ds4-server.service 2>/dev/null || true
+for container in vllm-server searxng; do
+    if docker container inspect "$container" >/dev/null 2>&1; then
+        docker stop "$container"
+    fi
+done
+echo "Known legacy services retired. No files, volumes, images, or containers were deleted."

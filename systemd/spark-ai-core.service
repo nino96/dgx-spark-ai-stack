@@ -1,0 +1,17 @@
+[Unit]
+Description=spark-ai-stack gateway and search
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=%h/code/spark-ai-stack/bin/stack core-up
+ExecStop=%h/code/spark-ai-stack/bin/stack core-down
+Restart=on-failure
+RestartSec=10
+TimeoutStartSec=900
+TimeoutStopSec=180
+
+[Install]
+WantedBy=default.target

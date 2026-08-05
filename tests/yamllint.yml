@@ -1,0 +1,11 @@
+---
+extends: default
+ignore: |
+  .venv/**
+rules:
+  line-length:
+    max: 160
+  truthy:
+    allowed-values: ["true", "false"]
+    check-keys: false
+  document-start: disable
