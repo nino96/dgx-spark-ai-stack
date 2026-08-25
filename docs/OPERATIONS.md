@@ -15,8 +15,8 @@ changes. Ansible refuses unsupported DMI/OS/GPU/CUDA baselines and provides no
 production bypass. Use vendor recovery or OTA before trying again.
 
 `stack apply` installs user units and enables linger. The core unit starts
-LiteLLM and SearXNG; the boot-model unit ensures Qwen is active after Docker is
-ready, without a graphical or SSH login.
+PostgreSQL, LiteLLM, Open WebUI, and SearXNG; the boot-model unit ensures Qwen
+is active after Docker is ready, without a graphical or SSH login.
 
 ## Secrets
 
@@ -25,15 +25,25 @@ bin/stack secrets-init
 chmod 0600 ~/.config/spark-ai-stack/secrets.env
 ```
 
-The command preserves existing values and fills missing LiteLLM/SearXNG values
-with cryptographically random strings. It derives separate mode-`0600`
-per-service environment files under `~/ai-data/state`, so containers receive
-only the credentials they need. `--import-hf-token` reads the existing
+The command preserves existing values and fills missing LiteLLM, PostgreSQL,
+Open WebUI, and SearXNG values with cryptographically random strings. It derives
+separate mode-`0600` per-service environment files under `~/ai-data/state`, so
+containers receive only the credentials they need. Provider keys are passed
+only to LiteLLM. `--import-hf-token` reads the existing
 `~/.huggingface/token` only when `HF_TOKEN` is empty. Never copy the prior
 SearXNG secret from `~/Documents`.
 
 Clients send the LiteLLM value as `Authorization: Bearer <key>`. Rotate it by
 editing the secrets file and running `bin/stack core-restart`.
+Do not rotate `PG_SUPERPASS` by editing the environment file: PostgreSQL uses
+that variable only to initialize a new data directory. Change the database
+role password transactionally and update the secret in the same maintenance
+window. Open WebUI admin bootstrap values are likewise not a password-reset
+mechanism after the database exists.
+
+For the separate HPT640 application migration, do not initialize target
+secrets first; follow [HPT640_MIGRATION.md](HPT640_MIGRATION.md), which
+preserves the existing LiteLLM/Open WebUI secrets and databases.
 
 ## Existing GX10 migration
 
@@ -62,6 +72,17 @@ bin/modelctl deactivate MODEL [--json]
 bin/modelctl status [--json]
 bin/modelctl logs MODEL
 ```
+
+The cloud portfolio uses stable intent aliases so clients do not need to track
+provider model names. Review the checked-in selection and compare its identity,
+pricing, and required capabilities with the live catalog using:
+
+```bash
+bin/cloud-models list
+bin/cloud-models check
+```
+
+See [CLOUD_MODELS.md](CLOUD_MODELS.md) for selection criteria and promotion.
 
 Activation validates the lockfile identity, artifact, available-memory floor,
 declared budgets, and pair allowlist. It then performs the transactional state
@@ -93,6 +114,8 @@ bin/modelctl logs qwen3.6-35b
 bin/modelctl logs qwen3.5-4b-gguf
 bin/modelctl logs deepseek-v4-flash
 docker logs -f spark-ai-litellm
+docker logs -f spark-ai-open-webui
+docker logs -f spark-ai-postgres
 docker logs -f spark-ai-searxng
 ```
 
@@ -102,12 +125,14 @@ Loopback checks:
 curl -fsS -H "Authorization: Bearer $LITELLM_MASTER_KEY" \
   http://127.0.0.1:4000/v1/models
 curl -fsS 'http://127.0.0.1:8888/search/?q=spark&format=json'
+curl -fsS http://127.0.0.1:3000/health
 ss -lntp
 free -h
 ```
 
-The host must show listeners at `127.0.0.1:4000`, `:8001`/`:8002`/`:8003` as
-active, and `:8888`; never `0.0.0.0` for these ports. On GB10, monitor
+The host must show listeners at `127.0.0.1:3000`, `:4000`, `:5432`,
+`:8001`/`:8002`/`:8003` as active, and `:8888`; never `0.0.0.0` for these
+ports. On GB10, monitor
 `MemAvailable`, swap growth, and process RSS because aggregate GPU memory may
 show `N/A`.
 
@@ -122,7 +147,7 @@ tailscale serve status
 ```
 
 The command resets only the local Serve configuration and establishes HTTPS
-proxies for `/v1` to port 4000 and `/search/` to port 8888. It never invokes
+proxies for `/` to Open WebUI, `/v1` to port 4000, and `/search/` to port 8888. It never invokes
 `tailscale funnel`, and it aborts if Tailscale has no MagicDNS DNS name.
 
 Test from another tailnet node:
@@ -133,6 +158,28 @@ curl -fsS -H 'Authorization: Bearer KEY' \
   https://HOSTNAME/v1/models
 curl -fsS 'https://HOSTNAME/search/?q=test&format=json'
 ```
+
+Subnet routing and exit-node duties are separate and opt-in. See
+[HPT640_MIGRATION.md](HPT640_MIGRATION.md); normal Serve configuration does
+not advertise either.
+
+## Optional DNS
+
+Pi-hole and AdGuard Home are separate, mutually exclusive Compose profiles.
+They are never started by the core unit or `stack apply`. `bin/dnsctl` handles
+private configuration, preflight, lifecycle, backup, and pinned updates:
+
+```bash
+bin/dnsctl init
+bin/dnsctl preflight
+bin/dnsctl up pihole           # or: adguard
+bin/dnsctl backup
+bin/dnsctl update-active
+bin/dnsctl down
+```
+
+Do not run these commands until you have reviewed the address binding, client
+cutover, and rollback procedure in [DNS_OPTIONS.md](DNS_OPTIONS.md).
 
 ## Concurrency soak gate
 
@@ -149,6 +196,17 @@ Only then change the combination status to `passed` in
 `config/concurrency.yaml` in a reviewed commit.
 
 ## Upgrades
+
+For the routine one-command workflow, backup contents, version-promotion gate,
+and rollback procedure, see [UPGRADES.md](UPGRADES.md):
+
+```bash
+bin/stack backup
+bin/update
+```
+
+`bin/update` also backs up and recreates an active optional DNS profile. It
+does nothing to DNS when neither profile is active.
 
 No component follows a floating tag. Upgrade one class of input per branch:
 

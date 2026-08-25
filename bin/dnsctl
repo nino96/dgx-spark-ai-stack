@@ -1,0 +1,203 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
+DATA_ROOT="${SPARK_AI_DATA_ROOT:-$HOME/ai-data}"
+DNS_ENV_FILE="${SPARK_AI_DNS_ENV_FILE:-$HOME/.config/spark-ai-stack/dns.env}"
+COMPOSE=(docker compose --project-name spark-ai-dns --project-directory "$ROOT/compose" --env-file "$DNS_ENV_FILE" --file "$ROOT/compose/dns.yml")
+
+usage() {
+    cat <<'EOF'
+Usage: bin/dnsctl COMMAND [options]
+
+Commands:
+  init                     Detect addresses and create private dns.env
+  preflight                Validate addresses and check port 53 conflicts
+  up pihole|adguard        Start exactly one optional DNS service
+  down                     Stop both DNS profiles; retain all data
+  status                   Show containers and configured non-secret addresses
+  logs pihole|adguard      Follow service logs
+  backup                   Back up the active DNS service and dns.env
+  update-active            Back up and recreate the active service at repo pins
+EOF
+}
+
+read_value() {
+    local key="$1" line
+    [[ -f "$DNS_ENV_FILE" ]] || return 0
+    while IFS= read -r line; do
+        if [[ "$line" == "$key="* ]]; then
+            printf '%s' "${line#*=}"
+            return 0
+        fi
+    done <"$DNS_ENV_FILE"
+}
+
+require_env() {
+    [[ -f "$DNS_ENV_FILE" ]] || { echo "dnsctl: run bin/dnsctl init first" >&2; exit 1; }
+    [[ "$(stat -c %a "$DNS_ENV_FILE")" == 600 ]] || { echo "dnsctl: $DNS_ENV_FILE must have mode 0600" >&2; exit 1; }
+}
+
+init_config() {
+    [[ $# -eq 0 ]] || { usage >&2; exit 2; }
+    [[ ! -e "$DNS_ENV_FILE" ]] || { echo "DNS configuration already exists: $DNS_ENV_FILE"; return; }
+    local lan_ip tailscale_ip timezone address_with_prefix lan_cidr temporary
+    lan_ip="$(ip -j route get 1.1.1.1 | jq -r '.[0].prefsrc // empty')"
+    tailscale_ip="$(tailscale ip -4 | head -n 1)"
+    timezone="$(timedatectl show --property=Timezone --value 2>/dev/null || true)"
+    [[ -n "$timezone" ]] || timezone="UTC"
+    [[ -n "$lan_ip" ]] || { echo "dnsctl: could not detect the default-route IPv4 address" >&2; exit 1; }
+    [[ -n "$tailscale_ip" ]] || { echo "dnsctl: could not detect a Tailscale IPv4 address" >&2; exit 1; }
+    address_with_prefix="$(ip -j address show | jq -r --arg ip "$lan_ip" '.[] | .addr_info[]? | select(.family == "inet" and .local == $ip) | "\(.local)/\(.prefixlen)"' | head -n 1)"
+    lan_cidr="$(printf '%s' "$address_with_prefix" | python3 -c 'import ipaddress,sys; print(ipaddress.ip_interface(sys.stdin.read().strip()).network)')"
+    umask 077
+    mkdir -p "$(dirname "$DNS_ENV_FILE")" "$DATA_ROOT/dns/pihole" "$DATA_ROOT/dns/adguard/work" "$DATA_ROOT/dns/adguard/conf" "$DATA_ROOT/backups/dns"
+    temporary="$(mktemp "$(dirname "$DNS_ENV_FILE")/.dns.env.XXXXXX")"
+    trap 'rm -f -- "$temporary"' EXIT
+    {
+        printf 'DNS_LAN_IP=%s\n' "$lan_ip"
+        printf 'DNS_LAN_CIDR=%s\n' "$lan_cidr"
+        printf 'DNS_TAILSCALE_IP=%s\n' "$tailscale_ip"
+        printf 'DNS_TIMEZONE=%s\n' "$timezone"
+        printf 'PIHOLE_PASSWORD=%s\n' "$(openssl rand -hex 24)"
+    } >"$temporary"
+    chmod 0600 "$temporary"
+    mv -f -- "$temporary" "$DNS_ENV_FILE"
+    trap - EXIT
+    echo "DNS configuration created at $DNS_ENV_FILE (0600); secret values were not printed."
+    echo "Review the detected addresses, reserve the LAN IP in the router, then run bin/dnsctl preflight."
+}
+
+is_running() {
+    [[ "$(docker inspect --format '{{.State.Running}}' "spark-ai-$1" 2>/dev/null || true)" == true ]]
+}
+
+active_service() {
+    if is_running pihole; then
+        printf '%s\n' pihole
+    elif is_running adguard; then
+        printf '%s\n' adguard
+    fi
+}
+
+preflight() {
+    require_env
+    local lan_ip tailscale_ip listeners target
+    lan_ip="$(read_value DNS_LAN_IP)"
+    tailscale_ip="$(read_value DNS_TAILSCALE_IP)"
+    [[ -n "$lan_ip" && -n "$tailscale_ip" ]] || { echo "dnsctl: DNS address values are empty" >&2; exit 1; }
+    ip -j address show | jq -e --arg lan "$lan_ip" --arg tail "$tailscale_ip" \
+        '[.[].addr_info[]?.local] | index($lan) != null and index($tail) != null' >/dev/null || {
+        echo "dnsctl: configured LAN or Tailscale address is not assigned to this host" >&2
+        exit 1
+    }
+    if [[ -z "$(active_service)" ]]; then
+        listeners="$(ss -H -lntu '( sport = :53 )' 2>/dev/null || true)"
+        for target in "0.0.0.0:53" "*:53" "[::]:53" "$lan_ip:53" "$tailscale_ip:53"; do
+            if grep -Fq "$target" <<<"$listeners"; then
+                echo "dnsctl: port 53 conflict at $target" >&2
+                printf '%s\n' "$listeners" >&2
+                exit 1
+            fi
+        done
+    fi
+    "${COMPOSE[@]}" config --quiet
+    echo "DNS preflight passed for LAN $lan_ip and Tailscale $tailscale_ip."
+}
+
+up_service() {
+    [[ $# -eq 1 && "$1" =~ ^(pihole|adguard)$ ]] || { usage >&2; exit 2; }
+    local service="$1" other
+    if [[ "$service" == pihole ]]; then
+        other=adguard
+    else
+        other=pihole
+    fi
+    if is_running "$other"; then
+        echo "dnsctl: $other is running; use bin/dnsctl down before switching" >&2
+        exit 1
+    fi
+    preflight
+    "${COMPOSE[@]}" --profile "$service" pull "$service"
+    "${COMPOSE[@]}" --profile "$service" up -d "$service"
+    echo "$service started. Keep router and tailnet DNS unchanged until client tests pass."
+}
+
+down_services() {
+    require_env
+    "${COMPOSE[@]}" --profile pihole --profile adguard down
+    echo "Optional DNS stopped; persistent data was retained."
+}
+
+show_status() {
+    require_env
+    "${COMPOSE[@]}" --profile pihole --profile adguard ps
+    printf 'LAN address: %s (%s)\n' "$(read_value DNS_LAN_IP)" "$(read_value DNS_LAN_CIDR)"
+    printf 'Tailscale address: %s\n' "$(read_value DNS_TAILSCALE_IP)"
+}
+
+follow_logs() {
+    [[ $# -eq 1 && "$1" =~ ^(pihole|adguard)$ ]] || { usage >&2; exit 2; }
+    docker logs -f "spark-ai-$1"
+}
+
+backup_active() {
+    require_env
+    local service image source destination was_running=0
+    service="$(active_service)"
+    [[ -n "$service" ]] || { echo "dnsctl: no DNS service is running" >&2; exit 1; }
+    destination="${1:-$DATA_ROOT/backups/dns/$(date +%Y%m%d-%H%M%S)-$service}"
+    [[ ! -e "$destination" ]] || { echo "dnsctl: backup destination exists: $destination" >&2; exit 1; }
+    source="$DATA_ROOT/dns/$service"
+    image="$(docker inspect --format '{{.Config.Image}}' "spark-ai-$service")"
+    resume_dns() {
+        if [[ "$was_running" -eq 1 ]]; then
+            docker start "spark-ai-$service" >/dev/null
+        fi
+    }
+    umask 077
+    mkdir -p "$destination"
+    docker stop "spark-ai-$service" >/dev/null
+    was_running=1
+    trap resume_dns EXIT
+    docker run --rm --user 0:0 --entrypoint tar --mount "type=bind,src=$source,dst=/source,readonly" "$image" -C /source -czf - . >"$destination/data.tar.gz"
+    install -m 0600 "$DNS_ENV_FILE" "$destination/dns.env"
+    {
+        printf 'created=%s\nservice=%s\nimage=%s\n' "$(date --iso-8601=seconds)" "$service" "$image"
+    } >"$destination/metadata.txt"
+    (cd "$destination" && sha256sum data.tar.gz dns.env metadata.txt >SHA256SUMS)
+    docker start "spark-ai-$service" >/dev/null
+    was_running=0
+    trap - EXIT
+    printf '%s\n' "$destination"
+}
+
+update_active() {
+    if [[ ! -f "$DNS_ENV_FILE" ]]; then
+        echo "Optional DNS is not initialized; nothing to update."
+        return
+    fi
+    require_env
+    local service
+    service="$(active_service)"
+    [[ -n "$service" ]] || { echo "No optional DNS service is active; nothing to update."; return; }
+    echo "DNS pre-update backup: $(backup_active)"
+    "${COMPOSE[@]}" --profile "$service" pull "$service"
+    "${COMPOSE[@]}" --profile "$service" up -d "$service"
+}
+
+command="${1:-}"
+[[ -n "$command" ]] || { usage; exit 2; }
+shift
+case "$command" in
+    init) init_config "$@" ;;
+    preflight) [[ $# -eq 0 ]] || { usage >&2; exit 2; }; preflight ;;
+    up) up_service "$@" ;;
+    down) [[ $# -eq 0 ]] || { usage >&2; exit 2; }; down_services ;;
+    status) [[ $# -eq 0 ]] || { usage >&2; exit 2; }; show_status ;;
+    logs) follow_logs "$@" ;;
+    backup) [[ $# -le 1 ]] || { usage >&2; exit 2; }; backup_active "$@" ;;
+    update-active) [[ $# -eq 0 ]] || { usage >&2; exit 2; }; update_active ;;
+    help|-h|--help) usage ;;
+    *) echo "dnsctl: unknown command: $command" >&2; usage >&2; exit 2 ;;
+esac

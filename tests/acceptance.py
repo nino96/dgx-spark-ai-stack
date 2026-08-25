@@ -54,6 +54,12 @@ def main() -> int:
         dest="active_models",
         help="expected active backend alias; repeat for concurrent profiles",
     )
+    parser.add_argument(
+        "--cloud-model",
+        action="append",
+        dest="cloud_models",
+        help="expected configured cloud alias; repeat for multiple aliases",
+    )
     parser.add_argument("--key-env", default="LITELLM_MASTER_KEY")
     parser.add_argument("--responses", action="store_true")
     args = parser.parse_args()
@@ -71,7 +77,8 @@ def main() -> int:
     listed = json.loads(raw)
     assert any(item["id"] == args.model for item in listed["data"])
     visible = {item["id"] for item in listed["data"]} - {"local/default"}
-    assert visible == set(args.active_models or [args.model]), visible
+    expected = set(args.active_models or [args.model]) | set(args.cloud_models or [])
+    assert visible == expected, {"visible": visible, "expected": expected}
 
     chat = {
         "model": args.model,

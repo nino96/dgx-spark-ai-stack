@@ -6,7 +6,7 @@ After=spark-ai-core.service
 [Service]
 Type=oneshot
 RemainAfterExit=yes
-ExecStart=%h/code/spark-ai-stack/bin/modelctl ensure-boot
+ExecStart=%h/.local/bin/spark-ai-modelctl ensure-boot
 TimeoutStartSec=1800
 
 [Install]

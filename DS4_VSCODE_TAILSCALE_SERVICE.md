@@ -1,7 +1,19 @@
 # DS4 server from VS Code over Tailscale
 
-This guide records the DGX Spark setup for using the local DS4 DeepSeek V4 Flash
-server from VS Code GitHub Copilot custom models.
+This guide records the legacy direct-DS4 setup. New clients should use the
+authenticated LiteLLM endpoint managed by this repository; `bin/modelctl`
+switches DS4 behind that stable URL without exposing port 8081.
+
+## Current recommended endpoint
+
+```text
+Endpoint: https://GX10-MAGICDNS-NAME/v1
+Model: deepseek-v4-flash
+API key: the LITELLM client key
+```
+
+Run `bin/modelctl activate deepseek-v4-flash --default` first. The remaining
+sections are retained only for diagnosing and retiring the old direct service.
 
 ## Current setup
 
@@ -9,8 +21,8 @@ server from VS Code GitHub Copilot custom models.
 - launcher: `~/.local/bin/ds4-serve`
 - bind address: `0.0.0.0`
 - port: `8081`
-- Tailscale address at setup time: `100.69.119.92`
-- OpenAI-compatible base URL: `http://100.69.119.92:8081/v1`
+- Tailscale address at setup time: intentionally not retained in Git
+- Legacy OpenAI-compatible base URL: `http://GX10-TAILSCALE-IP:8081/v1`
 - model ID: `deepseek-v4-flash`
 - server context allocation: `69632` tokens
 
@@ -25,7 +37,7 @@ if the device is removed and re-added to the tailnet.
 In GitHub Copilot's **Add Models > Custom Endpoint**, use:
 
 ```text
-Endpoint: http://100.69.119.92:8081/v1
+Endpoint: http://GX10-TAILSCALE-IP:8081/v1
 Model: deepseek-v4-flash
 API key: not-needed
 ```
@@ -33,7 +45,7 @@ API key: not-needed
 The endpoint can be checked from the client machine with:
 
 ```bash
-curl http://100.69.119.92:8081/v1/models
+curl http://GX10-TAILSCALE-IP:8081/v1/models
 ```
 
 Recommended initial custom-model limits:

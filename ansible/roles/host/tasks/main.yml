@@ -16,6 +16,7 @@
       - python3-pip
       - python3-venv
       - ripgrep
+      - rsync
     state: present
     update_cache: true
     cache_valid_time: 3600
@@ -69,10 +70,24 @@
     - "{{ spark_ai_data_root }}/src"
     - "{{ spark_ai_data_root }}/builds"
     - "{{ spark_ai_data_root }}/cache/searxng"
+    - "{{ spark_ai_data_root }}/postgres"
+    - "{{ spark_ai_data_root }}/open-webui"
+    - "{{ spark_ai_data_root }}/backups"
     - "{{ spark_ai_data_root }}/state"
     - "{{ spark_ai_data_root }}/tools"
     - "{{ spark_ai_home }}/.config/spark-ai-stack"
     - "{{ spark_ai_home }}/.config/systemd/user"
+    - "{{ spark_ai_home }}/.local/bin"
+
+- name: Install stable command links independent of repository location
+  ansible.builtin.file:
+    src: "{{ spark_ai_repo }}/{{ item.source }}"
+    dest: "{{ spark_ai_home }}/.local/bin/{{ item.target }}"
+    state: link
+    force: true
+  loop:
+    - {source: bin/stack, target: spark-ai-stack}
+    - {source: bin/modelctl, target: spark-ai-modelctl}
 
 - name: Install pinned Hugging Face CLI environment
   ansible.builtin.pip:

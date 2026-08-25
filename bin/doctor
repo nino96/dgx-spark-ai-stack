@@ -26,7 +26,7 @@ SECRETS_FILE = Path(
     )
 ).expanduser()
 LOCKS = json.loads((ROOT / "config" / "versions.lock.yaml").read_text())
-SERVICE_PORTS = {4000, 8001, 8002, 8003, 8888}
+SERVICE_PORTS = {3000, 4000, 5432, 8001, 8002, 8003, 8888}
 
 
 def command(
@@ -153,7 +153,13 @@ def main() -> int:
         content = SECRETS_FILE.read_text(encoding="utf-8")
         required = all(
             re.search(rf"^{key}=.+$", content, re.MULTILINE)
-            for key in ("LITELLM_MASTER_KEY", "SEARXNG_SECRET")
+            for key in (
+                "LITELLM_MASTER_KEY",
+                "PG_SUPERUSER",
+                "PG_SUPERPASS",
+                "WEBUI_SECRET_KEY",
+                "SEARXNG_SECRET",
+            )
         )
         add("secrets_required_values", required, "required values set" if required else "missing/empty required value")
     else:
@@ -195,6 +201,14 @@ def main() -> int:
     search_status = probe_url("http://127.0.0.1:8888/search/?q=health&format=json")
     if search_status is not None:
         add("searxng_health", search_status == 200, f"HTTP {search_status}")
+    webui_status = probe_url("http://127.0.0.1:3000/health")
+    if webui_status is not None:
+        add("open_webui_health", webui_status == 200, f"HTTP {webui_status}")
+    postgres = command(
+        ["docker", "inspect", "--format", "{{.State.Health.Status}}", "spark-ai-postgres"]
+    )
+    if postgres.returncode == 0:
+        add("postgres_health", postgres.stdout.strip() == "healthy", postgres.stdout.strip())
 
     if args.verify_images or args.full:
         cosign = shutil.which("cosign")
@@ -256,6 +270,7 @@ def main() -> int:
                 f"arm64_image_{image_name}",
                 inspected.returncode == 0 and inspected.stdout.strip() == "arm64",
                 (inspected.stderr or inspected.stdout).strip(),
+                "warning" if image.get("optional") else "error",
             )
 
         gpu_image = LOCKS["images"]["vllm_base"]["reference"]

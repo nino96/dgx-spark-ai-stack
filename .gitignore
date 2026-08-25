@@ -8,6 +8,7 @@ __pycache__/
 .venv/
 coverage.xml
 secrets.env
+dns.env
 state/
 models/
 *.gguf

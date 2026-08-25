@@ -1,0 +1,35 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
+DATA_ROOT="${SPARK_AI_DATA_ROOT:-$HOME/ai-data}"
+
+[[ $# -eq 0 ]] || { echo "Usage: bin/update" >&2; exit 2; }
+git -C "$ROOT" diff --quiet
+git -C "$ROOT" diff --cached --quiet
+[[ -z "$(git -C "$ROOT" status --short)" ]] || {
+    echo "update: repository has uncommitted or untracked files; review them first" >&2
+    exit 1
+}
+upstream="$(git -C "$ROOT" rev-parse --abbrev-ref --symbolic-full-name '@{upstream}' 2>/dev/null)" || {
+    echo "update: the current branch has no upstream" >&2
+    exit 1
+}
+previous="$(git -C "$ROOT" rev-parse HEAD)"
+git -C "$ROOT" pull --ff-only
+current="$(git -C "$ROOT" rev-parse HEAD)"
+mkdir -p "$DATA_ROOT/state"
+{
+    printf 'started=%s\n' "$(date --iso-8601=seconds)"
+    printf 'upstream=%s\n' "$upstream"
+    printf 'previous_commit=%s\n' "$previous"
+    printf 'candidate_commit=%s\n' "$current"
+} >"$DATA_ROOT/state/pending-upgrade.txt"
+if ! "$ROOT/bin/stack" upgrade; then
+    echo "update: convergence failed; services and data were not automatically rolled back" >&2
+    echo "Review $DATA_ROOT/state/pending-upgrade.txt and the pre-upgrade backup reported above." >&2
+    exit 1
+fi
+mv -f "$DATA_ROOT/state/pending-upgrade.txt" "$DATA_ROOT/state/previous-upgrade.txt"
+echo "Repository and application layer are current at $current."
+echo "Vendor firmware, DGX OS, kernel, driver, and CUDA were not changed."

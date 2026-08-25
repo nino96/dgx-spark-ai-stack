@@ -22,7 +22,8 @@ OEM's image.
 
 Recovery erases the internal SSD. Before beginning:
 
-- copy this Git repository, `~/ai-data`, the secrets file (securely), and any
+- copy this Git repository, a verified `bin/stack backup`, `~/ai-data`, the
+  secrets file (securely), and any
   unrelated user data to external storage;
 - record the current `/etc/dgx-release`, DMI data, `nvidia-smi`, Tailscale node
   name, and checksums;

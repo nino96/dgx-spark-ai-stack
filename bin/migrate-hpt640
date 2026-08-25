@@ -1,0 +1,153 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
+DATA_ROOT="${SPARK_AI_DATA_ROOT:-$HOME/ai-data}"
+SECRETS_FILE="${SPARK_AI_SECRETS_FILE:-$HOME/.config/spark-ai-stack/secrets.env}"
+LEGACY_ROOT="${HPT640_AI_GATEWAY_ROOT:-$HOME/infra/ai-gateway}"
+LEGACY_COMPOSE=(docker compose --project-directory "$LEGACY_ROOT" --file "$LEGACY_ROOT/compose.yaml")
+TARGET_COMPOSE=(docker compose --project-name spark-ai-stack --project-directory "$ROOT/compose" --file "$ROOT/compose/compose.yml")
+
+usage() {
+    cat <<'EOF'
+Usage:
+  bin/migrate-hpt640 export [DIRECTORY] [--leave-stopped]
+  bin/migrate-hpt640 import DIRECTORY
+
+Export runs on the HPT640. It briefly stops LiteLLM and Open WebUI, creates
+consistent PostgreSQL dumps, copies Open WebUI files and the legacy .env into
+a private checksummed bundle, and normally restarts both apps.
+
+Import runs on the GX10 before `bin/stack apply`. It refuses an existing
+secrets file, non-empty PostgreSQL databases, or non-empty Open WebUI data.
+Nothing is deleted from either host.
+EOF
+}
+
+read_env() {
+    local file="$1" key="$2" line
+    while IFS= read -r line; do
+        if [[ "$line" == "$key="* ]]; then
+            printf '%s' "${line#*=}"
+            return 0
+        fi
+    done <"$file"
+}
+
+export_bundle() {
+    local destination="" leave_stopped=0 argument pg_user apps_stopped=0
+    resume_legacy_apps() {
+        if [[ "$apps_stopped" -eq 1 && "$leave_stopped" -eq 0 ]]; then
+            "${LEGACY_COMPOSE[@]}" start litellm open-webui >/dev/null
+        fi
+    }
+    for argument in "$@"; do
+        case "$argument" in
+            --leave-stopped) leave_stopped=1 ;;
+            -*) echo "migrate-hpt640: unknown export option: $argument" >&2; exit 2 ;;
+            *) [[ -z "$destination" ]] || { echo "migrate-hpt640: only one destination is allowed" >&2; exit 2; }; destination="$argument" ;;
+        esac
+    done
+    destination="${destination:-$HOME/hpt640-ai-export/$(date +%Y%m%d-%H%M%S)}"
+    [[ -f "$LEGACY_ROOT/.env" ]] || { echo "migrate-hpt640: missing $LEGACY_ROOT/.env" >&2; exit 1; }
+    [[ ! -e "$destination" ]] || { echo "migrate-hpt640: destination exists: $destination" >&2; exit 1; }
+    docker inspect ai-postgres litellm open-webui >/dev/null
+    pg_user="$(read_env "$LEGACY_ROOT/.env" PG_SUPERUSER)"
+    [[ -n "$pg_user" ]] || { echo "migrate-hpt640: PG_SUPERUSER is empty" >&2; exit 1; }
+
+    umask 077
+    mkdir -p "$destination/open-webui-data"
+    "${LEGACY_COMPOSE[@]}" stop open-webui litellm >/dev/null
+    apps_stopped=1
+    trap resume_legacy_apps EXIT
+    docker exec ai-postgres pg_dump -U "$pg_user" --format=custom --no-owner --no-privileges openwebui >"$destination/openwebui.dump"
+    docker exec ai-postgres pg_dump -U "$pg_user" --format=custom --no-owner --no-privileges litellm >"$destination/litellm.dump"
+    docker cp open-webui:/app/backend/data/. "$destination/open-webui-data"
+    install -m 0600 "$LEGACY_ROOT/.env" "$destination/secrets.env"
+    install -m 0600 "$LEGACY_ROOT/litellm/config.yaml" "$destination/legacy-litellm-config.yaml"
+    {
+        printf 'created=%s\n' "$(date --iso-8601=seconds)"
+        printf 'source_host=%s\n' "$(hostname)"
+        printf 'source_root=%s\n' "$LEGACY_ROOT"
+        printf 'applications_left_stopped=%s\n' "$leave_stopped"
+        docker inspect --format '{{.Name}} {{.Config.Image}} {{.Image}}' ai-postgres litellm open-webui
+    } >"$destination/metadata.txt"
+    (
+        cd "$destination"
+        find . -type f ! -name SHA256SUMS -print0 | sort -z | xargs -0 sha256sum >SHA256SUMS
+    )
+    chmod -R go-rwx "$destination"
+    if [[ "$leave_stopped" -eq 0 ]]; then
+        "${LEGACY_COMPOSE[@]}" start litellm open-webui >/dev/null
+        apps_stopped=0
+        trap - EXIT
+    else
+        apps_stopped=0
+        trap - EXIT
+    fi
+    echo "Migration bundle ready: $destination"
+    if [[ "$leave_stopped" -eq 1 ]]; then
+        echo "Legacy LiteLLM and Open WebUI remain stopped for final cutover. PostgreSQL remains running."
+    else
+        echo "Legacy services were restarted. Use --leave-stopped only for the final cutover export."
+    fi
+}
+
+wait_for_postgres() {
+    local remaining=60
+    while [[ "$(docker inspect --format '{{.State.Health.Status}}' spark-ai-postgres 2>/dev/null || true)" != healthy ]]; do
+        remaining=$((remaining - 1))
+        [[ "$remaining" -gt 0 ]] || { echo "migrate-hpt640: target PostgreSQL did not become healthy" >&2; return 1; }
+        sleep 2
+    done
+}
+
+database_is_empty() {
+    local database="$1" pg_user="$2"
+    [[ "$(docker exec spark-ai-postgres psql -U "$pg_user" -d "$database" -Atqc "SELECT count(*) FROM pg_tables WHERE schemaname NOT IN ('pg_catalog','information_schema')")" == 0 ]]
+}
+
+import_bundle() {
+    [[ $# -eq 1 ]] || { usage >&2; exit 2; }
+    local bundle="$1" pg_user
+    [[ -d "$bundle" && -f "$bundle/SHA256SUMS" ]] || { echo "migrate-hpt640: invalid bundle: $bundle" >&2; exit 1; }
+    (
+        cd "$bundle"
+        sha256sum --check SHA256SUMS
+    )
+    [[ ! -e "$SECRETS_FILE" ]] || { echo "migrate-hpt640: refusing existing secrets file: $SECRETS_FILE" >&2; exit 1; }
+    if [[ -d "$DATA_ROOT/open-webui" ]] && find "$DATA_ROOT/open-webui" -mindepth 1 -print -quit | grep -q .; then
+        echo "migrate-hpt640: refusing non-empty target: $DATA_ROOT/open-webui" >&2
+        exit 1
+    fi
+    umask 077
+    mkdir -p "$(dirname "$SECRETS_FILE")" "$DATA_ROOT/open-webui"
+    install -m 0600 "$bundle/secrets.env" "$SECRETS_FILE"
+    "$ROOT/bin/stack" secrets-init
+    "$ROOT/bin/stack" render-config
+    pg_user="$(read_env "$SECRETS_FILE" PG_SUPERUSER)"
+    "${TARGET_COMPOSE[@]}" up -d postgres
+    wait_for_postgres
+    database_is_empty openwebui "$pg_user" || { echo "migrate-hpt640: target openwebui database is not empty" >&2; exit 1; }
+    database_is_empty litellm "$pg_user" || { echo "migrate-hpt640: target litellm database is not empty" >&2; exit 1; }
+    docker exec -i spark-ai-postgres pg_restore -U "$pg_user" --no-owner --no-privileges -d openwebui <"$bundle/openwebui.dump"
+    docker exec -i spark-ai-postgres pg_restore -U "$pg_user" --no-owner --no-privileges -d litellm <"$bundle/litellm.dump"
+    cp -a "$bundle/open-webui-data/." "$DATA_ROOT/open-webui/"
+    {
+        printf 'imported=%s\n' "$(date --iso-8601=seconds)"
+        printf 'bundle=%s\n' "$bundle"
+        printf 'source_metadata_sha256=%s\n' "$(sha256sum "$bundle/metadata.txt" | awk '{print $1}')"
+    } >"$DATA_ROOT/state/hpt640-import.txt"
+    echo "HPT640 data imported. Run bin/stack apply, then bin/stack tailscale-configure and the acceptance checks."
+    echo "The source bundle and HPT640 data were retained."
+}
+
+command="${1:-}"
+[[ -n "$command" ]] || { usage; exit 2; }
+shift
+case "$command" in
+    export) export_bundle "$@" ;;
+    import) import_bundle "$@" ;;
+    help|-h|--help) usage ;;
+    *) echo "migrate-hpt640: unknown command: $command" >&2; usage >&2; exit 2 ;;
+esac

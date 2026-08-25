@@ -39,11 +39,29 @@ class ModelctlTests(unittest.TestCase):
         self.temp.cleanup()
 
     def test_routes_contain_only_active_models_and_default_alias(self) -> None:
-        rendered = modelctl.render_routes(["qwen3.6-35b"], "qwen3.6-35b")
+        rendered = modelctl.render_routes(
+            ["qwen3.6-35b"], "qwen3.6-35b", available_secrets=set()
+        )
         self.assertIn('model_name: "qwen3.6-35b"', rendered)
         self.assertIn('model_name: "local/default"', rendered)
         self.assertNotIn("qwen3.5-4b-gguf", rendered)
         self.assertNotIn("deepseek-v4-flash", rendered)
+
+    def test_cloud_routes_require_their_provider_secret(self) -> None:
+        without_key = modelctl.render_routes([], None, available_secrets=set())
+        with_key = modelctl.render_routes(
+            [], None, available_secrets={"OPENROUTER_API_KEY"}
+        )
+        self.assertNotIn("cloud/economy", without_key)
+        for alias in (
+            "cloud/economy",
+            "cloud/general",
+            "cloud/multimodal",
+            "cloud/coding",
+        ):
+            self.assertIn(alias, with_key)
+        self.assertIn("os.environ/OPENROUTER_API_KEY", with_key)
+        self.assertNotIn("grok-4.1-fast", with_key)
 
     def test_pending_pair_behaves_exclusively(self) -> None:
         desired = modelctl.desired_activation(["qwen3.6-35b"], "qwen3.5-4b-gguf")

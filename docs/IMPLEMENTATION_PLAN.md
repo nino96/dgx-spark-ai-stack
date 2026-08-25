@@ -15,9 +15,12 @@ Spark inference and automatic SearXNG tool injection are out of scope.
 ## Decisions
 
 1. Use Ansible for host convergence and Docker Compose for container services.
-2. Use LiteLLM as the stable gateway. It binds to loopback with a master key.
-3. Boot the gateway, SearXNG, and the NVIDIA Qwen3.6 35B NVFP4 profile.
-4. Publish gateway `/v1` and SearXNG `/search/` only through Tailscale Serve.
+2. Use LiteLLM as the stable gateway. It binds to loopback with a master key
+   and stores virtual-key/spend state in PostgreSQL.
+3. Boot PostgreSQL, Open WebUI, the gateway, SearXNG, and the NVIDIA Qwen3.6
+   35B NVFP4 profile.
+4. Publish Open WebUI `/`, gateway `/v1`, and SearXNG `/search/` only through
+   Tailscale Serve.
 5. Keep vendor firmware, BIOS, kernel, GPU driver, CUDA, and DGX OS outside
    Ansible. Unsupported hosts stop at preflight with vendor recovery guidance.
 6. Run Qwen and the 4B llama.cpp profile together only after a local soak gate
@@ -30,6 +33,8 @@ Spark inference and automatic SearXNG tool injection are out of scope.
 10. Keep NVIDIA Qwen as the default. Unsloth Fast remains disabled until a
     same-machine A/B gate demonstrates stable, material improvement without a
     task-suite regression.
+11. Keep Pi-hole and AdGuard Home outside the core service graph as explicit,
+    mutually exclusive profiles with independent backups and rollback.
 
 ## Locked inputs
 
@@ -48,6 +53,10 @@ The machine-readable source of truth is `config/versions.lock.yaml`.
 | NGC vLLM ARM64 | `26.06-py3@sha256:47539d1e...b279a` |
 | LiteLLM | `v1.86.2@sha256:c0fded5f...6e8f1` |
 | SearXNG ARM64 | `2026.7.3@sha256:a27984e8...c0c7` |
+| PostgreSQL ARM64 | `16.10@sha256:d6128f87...17dcf` |
+| Open WebUI ARM64 | `v0.10.2@sha256:0d58a667...b81e3` |
+| Pi-hole ARM64 (optional) | `2026.07.2@sha256:a29ad980...1d34` |
+| AdGuard Home ARM64 (optional) | `v0.107.76@sha256:bd12e2cd...f2ce` |
 | FastAPI workaround | exact `0.136.3` |
 | Cosign ARM64 | `v3.0.6`, SHA-256 `bedac92e...ef2b8` |
 
@@ -86,6 +95,8 @@ fetched from its immutable introducing commit and checked by SHA-256.
 - Restart the gateway only after a new backend is healthy.
 - Keep the prior active state and route file for rollback.
 - Publish with Tailscale Serve; never enable Funnel.
+- Keep optional DNS outside the core systemd unit and publish port 53 only on
+  operator-confirmed LAN and Tailscale addresses.
 
 ### Lifecycle controller
 

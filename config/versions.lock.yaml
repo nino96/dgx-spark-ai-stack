@@ -1,6 +1,6 @@
 {
   "schema": 1,
-  "generated": "2026-08-06",
+  "generated": "2026-08-26",
   "sources": {
     "ds4": {
       "repository": "https://github.com/Entrpi/ds4.git",
@@ -31,6 +31,28 @@
       "reference": "docker.io/searxng/searxng:2026.7.3@sha256:a27984e88335cc72263509cec1173d27e58b63dbf99b438b7faa96c6c306c0c7",
       "platform": "linux/arm64",
       "release_index_reference": "docker.io/searxng/searxng:2026.7.3@sha256:b7492e1b8fcb376191809982e6a45dc809a5d0e641d81feaa53a1fac6c599b9e"
+    },
+    "postgres": {
+      "reference": "docker.io/library/postgres:16.10@sha256:d6128f87af47b927176b6e957e6b722624f87d772afa61f3cd1e2f0e52117dcf",
+      "platform": "linux/arm64",
+      "release_index_reference": "docker.io/library/postgres:16.10@sha256:21f6013073bc6b92830a2129570e2f5ec42a6c734b5a985a41e83aa58f54c3c1"
+    },
+    "open_webui": {
+      "reference": "ghcr.io/open-webui/open-webui:v0.10.2@sha256:0d58a66704d69e52da83f72bcd43869ad4fd0c761313778bc95ef6940a0b81e3",
+      "platform": "linux/arm64",
+      "release_index_reference": "ghcr.io/open-webui/open-webui:v0.10.2@sha256:9fcea9c6e32ab60b0498f3986c6cdf651ddbe61db48d2213a3d28048ddd673d4"
+    },
+    "pihole": {
+      "reference": "docker.io/pihole/pihole:2026.07.2@sha256:a29ad980775f38a8e7524a206ff9c125bc6fcfd9de8de1fc93d2de0671cc1d34",
+      "platform": "linux/arm64",
+      "release_index_reference": "docker.io/pihole/pihole:2026.07.2@sha256:f7d1be836e3bc608b56d82fc9904f5a831cdfbc0dc9c6d58f94e4c985c70038b",
+      "optional": true
+    },
+    "adguard_home": {
+      "reference": "docker.io/adguard/adguardhome:v0.107.76@sha256:bd12e2cd483737b6b51a056bc5cc5d5d544b94f14a7aae93ce2f83943760f2ce",
+      "platform": "linux/arm64",
+      "release_index_reference": "docker.io/adguard/adguardhome:v0.107.76@sha256:7157eb1dc3b26c7af1d6898759a7b3f7d0fa09891fbd2d3caa6abc1057a9179b",
+      "optional": true
     }
   },
   "tools": {

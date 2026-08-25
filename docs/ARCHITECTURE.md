@@ -5,23 +5,29 @@
 ```text
 tailnet client
      |
-     | HTTPS + LiteLLM bearer key
+     | HTTPS (LiteLLM additionally requires a bearer key)
      v
 Tailscale Serve (no Funnel)
-     | /v1/*                  | /search/*
-     v                        v
-127.0.0.1:4000           127.0.0.1:8888
-LiteLLM                  SearXNG container
-     |
-     +-- 127.0.0.1:8001  vLLM container / Qwen3.6 35B
-     +-- 127.0.0.1:8002  llama.cpp user service / Qwen3.5 4B
-     `-- 127.0.0.1:8003  DS4 user service / DeepSeek V4 Flash
+     | /                  | /v1/*                  | /search/*
+     v                    v                        v
+Open WebUI            127.0.0.1:4000           127.0.0.1:8888
+127.0.0.1:3000        LiteLLM                  SearXNG container
+     |                    |
+     +---- PostgreSQL ----+
+          127.0.0.1:5432  +-- 127.0.0.1:8001  vLLM / Qwen3.6 35B
+                          +-- 127.0.0.1:8002  llama.cpp / Qwen3.5 4B
+                          `-- 127.0.0.1:8003  DS4 / DeepSeek V4 Flash
 ```
 
-LiteLLM uses host networking but explicitly binds to `127.0.0.1`. The other
-containers publish to `127.0.0.1`, and native servers also bind only to
-loopback. Tailscale Serve is the sole ingress. SearXNG has its own `/search/`
-path and is not injected into model prompts by this stack.
+LiteLLM and Open WebUI use host networking but explicitly bind to `127.0.0.1`.
+PostgreSQL, vLLM, and SearXNG publish only to `127.0.0.1`, and native servers
+also bind only to loopback. Tailscale Serve is the sole ingress. SearXNG has
+its own `/search/` path and is not injected into model prompts by this stack.
+
+An optional Pi-hole or AdGuard Home profile sits outside this core topology.
+When explicitly enabled, DNS is published only on the configured LAN and
+Tailscale host addresses while its web console remains on loopback. The two
+profiles are mutually exclusive and are not dependencies of the AI services.
 
 ## Persistent layout
 
@@ -32,6 +38,10 @@ path and is not injected into model prompts by this stack.
 ├── src/               # locked source checkouts
 ├── builds/            # native build output/symlinks
 ├── cache/searxng/     # search cache
+├── postgres/          # Open WebUI and LiteLLM databases
+├── open-webui/        # uploads, vector data, and UI files
+├── dns/               # optional Pi-hole and AdGuard Home state
+├── backups/           # private local logical backups (copy off-host)
 └── state/             # active.json, routes, locks, derived mode-0600 service env
 
 ~/.config/spark-ai-stack/
@@ -49,6 +59,14 @@ weights, credentials, generated routes, logs, and state are excluded.
 | `qwen3.5-4b-gguf` | llama.cpp | Manual, pending concurrency gate |
 | `deepseek-v4-flash` | DS4 | Always exclusive |
 | `local/default` | Generated alias | Qwen normally, DS4 while DS4 is active |
+
+Cloud aliases are declarative in `config/cloud-models.yaml` and are appended to
+the generated route file only when their provider secret is configured. They
+do not participate in local memory admission or model activation.
+
+The stable cloud aliases express intent—economy, general, multimodal, and
+coding—so provider models can be reviewed and replaced without changing every
+client.
 
 The route generator includes only running, healthy models. Therefore
 `GET /v1/models` reports active models rather than the entire catalog.
@@ -100,3 +118,5 @@ exclusive. DS4 cannot be allowlisted with another backend.
 - LiteLLM owns client authentication. Backend ports trust loopback only.
 - Tailscale identity protects network reachability; it does not replace the
   LiteLLM bearer key.
+- Optional DNS serves only the explicitly bound private interfaces. Its admin
+  interface remains on loopback and is independent of Tailscale Serve.

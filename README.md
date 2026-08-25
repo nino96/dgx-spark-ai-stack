@@ -12,14 +12,23 @@ and update path, then use this repository for the application layer.
 
 | Component | Loopback address | Purpose |
 |---|---:|---|
-| LiteLLM | `127.0.0.1:4000` | Stable OpenAI gateway and API-key enforcement |
+| Open WebUI | `127.0.0.1:3000` | Household chat UI, users, and uploads |
+| LiteLLM | `127.0.0.1:4000` | Stable OpenAI gateway, virtual keys, and routing |
+| PostgreSQL 16 | `127.0.0.1:5432` | Open WebUI and LiteLLM state |
 | vLLM | `127.0.0.1:8001` | Default NVIDIA Qwen3.6 35B backend |
 | llama.cpp | `127.0.0.1:8002` | Small GGUF backend |
 | DS4 | `127.0.0.1:8003` | Exclusive DeepSeek V4 Flash backend |
 | SearXNG | `127.0.0.1:8888` | Private metasearch |
 
-Tailscale Serve publishes only `https://<magicdns-name>/v1` and
-`https://<magicdns-name>/search/`. Funnel and LAN listeners are not used.
+Tailscale Serve publishes Open WebUI at `https://<magicdns-name>/`, the API at
+`/v1`, and SearXNG at `/search/`. Funnel and LAN listeners are not used.
+The intent-based OpenRouter aliases `cloud/economy`, `cloud/general`,
+`cloud/multimodal`, and `cloud/coding` appear only when the provider key is
+configured; local aliases continue to be managed transactionally.
+
+Pi-hole and AdGuard Home are optional, mutually exclusive profiles. Neither is
+part of the core unit or enabled by `stack apply`; see the DNS guide before
+making the GPU host a household dependency.
 
 ## Fresh installation
 
@@ -46,8 +55,12 @@ playbook installs missing application packages, builds the native SM121
 backends, installs user services, enables linger, and refuses unsupported host
 baselines. It never upgrades the vendor platform layer.
 
-On this already-configured GX10, run the non-destructive migration before the
-playbook starts replacement services:
+To migrate the HPT640 PostgreSQL databases, Open WebUI files, gateway secrets,
+and provider keys, use the staged procedure in
+[HPT640 migration and cutover](docs/HPT640_MIGRATION.md). It keeps the old host
+recoverable. DNS migration is a separate, optional cutover.
+
+On an already-configured GX10, the separate model-artifact migration remains:
 
 ```bash
 bin/stack secrets-init --import-hf-token
@@ -74,6 +87,11 @@ bin/modelctl activate deepseek-v4-flash --default
 bin/modelctl deactivate deepseek-v4-flash
 bin/modelctl logs qwen3.6-35b
 bin/stack status
+bin/stack backup
+bin/update
+bin/cloud-models list
+bin/cloud-models check
+bin/dnsctl status              # only after optional DNS initialization
 ```
 
 DS4 always runs exclusively. Deactivating it restores Qwen. Requests never
@@ -85,5 +103,9 @@ Detailed guidance:
 - [Implementation plan](docs/IMPLEMENTATION_PLAN.md)
 - [Architecture and memory policy](docs/ARCHITECTURE.md)
 - [Operations, migration, upgrades, and rollback](docs/OPERATIONS.md)
+- [HPT640 workload and Tailscale migration](docs/HPT640_MIGRATION.md)
+- [OpenRouter cloud model selection](docs/CLOUD_MODELS.md)
+- [Optional Pi-hole or AdGuard Home](docs/DNS_OPTIONS.md)
+- [Routine upgrades, backups, and rollback](docs/UPGRADES.md)
 - [ASUS/NVIDIA recovery boundary](docs/RECOVERY.md)
 - [Compatibility evidence and promotion gates](docs/COMPATIBILITY.md)

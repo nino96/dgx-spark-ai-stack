@@ -56,7 +56,9 @@
       - --file
       - "{{ spark_ai_repo }}/compose/compose.yml"
       - pull
+      - postgres
       - litellm
+      - open-webui
       - searxng
   become: true
   become_user: "{{ spark_ai_user }}"

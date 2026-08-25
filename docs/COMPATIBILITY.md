@@ -61,3 +61,11 @@ paths expected by LiteLLM and SearXNG. Recheck this behavior when upgrading
 Tailscale because its Serve CLI and configuration format have changed before.
 
 Reference: [Tailscale Serve command](https://tailscale.com/docs/reference/tailscale-cli/serve)
+
+## Optional DNS images
+
+The Pi-hole and AdGuard Home profiles use immutable ARM64 platform digests in
+`compose/dns.yml`. They are not required for core acceptance and are reported
+as optional by the image checker. Promotion requires Compose validation, a
+consistent backup, LAN and tailnet queries over TCP and UDP, filtering tests,
+and a client rollback test before changing router or tailnet DNS settings.

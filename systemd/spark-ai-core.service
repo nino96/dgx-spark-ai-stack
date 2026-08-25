@@ -1,13 +1,13 @@
 [Unit]
-Description=spark-ai-stack gateway and search
+Description=spark-ai-stack gateway, UI, database, and search
 Wants=network-online.target
 After=network-online.target
 
 [Service]
 Type=oneshot
 RemainAfterExit=yes
-ExecStart=%h/code/spark-ai-stack/bin/stack core-up
-ExecStop=%h/code/spark-ai-stack/bin/stack core-down
+ExecStart=%h/.local/bin/spark-ai-stack core-up
+ExecStop=%h/.local/bin/spark-ai-stack core-down
 Restart=on-failure
 RestartSec=10
 TimeoutStartSec=900

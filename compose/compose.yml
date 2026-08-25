@@ -1,6 +1,32 @@
 name: spark-ai-stack
 
 services:
+  postgres:
+    image: docker.io/library/postgres:16.10@sha256:d6128f87af47b927176b6e957e6b722624f87d772afa61f3cd1e2f0e52117dcf
+    container_name: spark-ai-postgres
+    restart: unless-stopped
+    env_file:
+      - ${SPARK_AI_DATA_ROOT:-${HOME}/ai-data}/state/postgres.env
+    environment:
+      POSTGRES_DB: postgres
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $${POSTGRES_USER} -d postgres"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+    volumes:
+      - ${SPARK_AI_DATA_ROOT:-${HOME}/ai-data}/postgres:/var/lib/postgresql/data
+      - ${SPARK_AI_DATA_ROOT:-${HOME}/ai-data}/state/postgres-init.sql:/docker-entrypoint-initdb.d/01-create-databases.sql:ro
+    ports:
+      - "127.0.0.1:5432:5432"
+    logging:
+      driver: local
+      options:
+        max-size: "10m"
+        max-file: "3"
+    security_opt:
+      - no-new-privileges:true
+
   litellm:
     image: ghcr.io/berriai/litellm:v1.86.2@sha256:c0fded5fc397836c9f75220f3a3cacf8dca1525be8b474b068233afd3fe6e8f1
     container_name: spark-ai-litellm
@@ -21,6 +47,36 @@ services:
       - "4000"
     security_opt:
       - no-new-privileges:true
+    depends_on:
+      postgres:
+        condition: service_healthy
+    logging:
+      driver: local
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+  open-webui:
+    image: ghcr.io/open-webui/open-webui:v0.10.2@sha256:0d58a66704d69e52da83f72bcd43869ad4fd0c761313778bc95ef6940a0b81e3
+    container_name: spark-ai-open-webui
+    network_mode: host
+    restart: unless-stopped
+    env_file:
+      - ${SPARK_AI_DATA_ROOT:-${HOME}/ai-data}/state/open-webui.env
+    volumes:
+      - ${SPARK_AI_DATA_ROOT:-${HOME}/ai-data}/open-webui:/app/backend/data
+    depends_on:
+      postgres:
+        condition: service_healthy
+      litellm:
+        condition: service_started
+    logging:
+      driver: local
+      options:
+        max-size: "10m"
+        max-file: "3"
+    security_opt:
+      - no-new-privileges:true
 
   searxng:
     image: docker.io/searxng/searxng:2026.7.3@sha256:a27984e88335cc72263509cec1173d27e58b63dbf99b438b7faa96c6c306c0c7
@@ -35,6 +91,11 @@ services:
       - ${SPARK_AI_DATA_ROOT:-${HOME}/ai-data}/cache/searxng:/var/cache/searxng
     security_opt:
       - no-new-privileges:true
+    logging:
+      driver: local
+      options:
+        max-size: "10m"
+        max-file: "3"
 
   vllm:
     profiles: [models]
@@ -100,3 +161,8 @@ services:
       - qwen3_coder
     security_opt:
       - no-new-privileges:true
+    logging:
+      driver: local
+      options:
+        max-size: "25m"
+        max-file: "4"
