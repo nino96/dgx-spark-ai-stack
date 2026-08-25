@@ -1,0 +1,13 @@
+[Unit]
+Description=DS4 DeepSeek V4 Flash server
+After=network-online.target tailscaled.service
+Wants=network-online.target
+
+[Service]
+ExecStart=%h/.local/bin/ds4-serve --host 0.0.0.0 --port 8081 -c 69632
+Restart=on-failure
+RestartSec=10
+Environment=PATH=%h/.local/bin:/usr/local/bin:/usr/bin:/bin
+
+[Install]
+WantedBy=default.target
