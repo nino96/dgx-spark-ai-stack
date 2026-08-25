@@ -35,7 +35,7 @@ read_env() {
 }
 
 export_bundle() {
-    local destination="" leave_stopped=0 argument pg_user apps_stopped=0
+    local destination="" leave_stopped=0 argument checksum_manifest pg_user apps_stopped=0
     resume_legacy_apps() {
         if [[ "$apps_stopped" -eq 1 && "$leave_stopped" -eq 0 ]]; then
             "${LEGACY_COMPOSE[@]}" start litellm open-webui >/dev/null
@@ -72,10 +72,15 @@ export_bundle() {
         printf 'applications_left_stopped=%s\n' "$leave_stopped"
         docker inspect --format '{{.Name}} {{.Config.Image}} {{.Image}}' ai-postgres litellm open-webui
     } >"$destination/metadata.txt"
-    (
+    checksum_manifest="$(mktemp)"
+    if ! (
         cd "$destination"
-        find . -type f ! -name SHA256SUMS -print0 | sort -z | xargs -0 sha256sum >SHA256SUMS
-    )
+        find . -type f ! -name SHA256SUMS -print0 | sort -z | xargs -0 sha256sum
+    ) >"$checksum_manifest"; then
+        rm -f -- "$checksum_manifest"
+        return 1
+    fi
+    mv -- "$checksum_manifest" "$destination/SHA256SUMS"
     chmod -R go-rwx "$destination"
     if [[ "$leave_stopped" -eq 0 ]]; then
         "${LEGACY_COMPOSE[@]}" start litellm open-webui >/dev/null

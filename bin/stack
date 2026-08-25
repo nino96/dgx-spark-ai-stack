@@ -364,7 +364,7 @@ backup_stack() {
     [[ $# -le 1 ]] || { echo "stack: backup accepts at most one destination" >&2; exit 2; }
     [[ ! -e "$destination" ]] || { echo "stack: backup destination already exists: $destination" >&2; exit 1; }
     [[ -f "$SECRETS_FILE" ]] || { echo "stack: secrets file is missing: $SECRETS_FILE" >&2; exit 1; }
-    local pg_user webui_was_running=0
+    local checksum_manifest pg_user webui_was_running=0
     resume_webui() {
         if [[ "$webui_was_running" -eq 1 ]]; then
             docker start spark-ai-open-webui >/dev/null
@@ -394,10 +394,15 @@ backup_stack() {
         docker inspect --format '{{.Name}} {{.Config.Image}} {{.Image}}' \
             spark-ai-postgres spark-ai-litellm spark-ai-open-webui spark-ai-searxng 2>/dev/null || true
     } >"$destination/metadata.txt"
-    (
+    checksum_manifest="$(mktemp)"
+    if ! (
         cd "$destination"
-        find . -type f ! -name SHA256SUMS -print0 | sort -z | xargs -0 sha256sum >SHA256SUMS
-    )
+        find . -type f ! -name SHA256SUMS -print0 | sort -z | xargs -0 sha256sum
+    ) >"$checksum_manifest"; then
+        rm -f -- "$checksum_manifest"
+        return 1
+    fi
+    mv -- "$checksum_manifest" "$destination/SHA256SUMS"
     chmod -R go-rwx "$destination"
     if [[ "$webui_was_running" -eq 1 ]]; then
         docker start spark-ai-open-webui >/dev/null
