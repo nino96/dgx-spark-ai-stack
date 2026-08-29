@@ -1,49 +1,164 @@
-{
-  "schema": 1,
-  "boot_model": "qwen3.6-35b",
-  "normal_default": "qwen3.6-35b",
-  "models": {
-    "qwen3.6-35b": {
-      "runtime": "vllm",
-      "service": "vllm",
-      "source": "nvidia/Qwen3.6-35B-A3B-NVFP4",
-      "revision": "491c2f1ea524c639598bf8fa787a93fed5a6fbce",
-      "api_base": "http://127.0.0.1:8001/v1",
-      "health_url": "http://127.0.0.1:8001/v1/models",
-      "memory_budget_gib": 72,
-      "exclusive": false,
-      "boot": true
-    },
-    "qwen3.5-4b-gguf": {
-      "runtime": "llama_cpp",
-      "service": "spark-ai-llama.service",
-      "source": "bartowski/Qwen_Qwen3.5-4B-GGUF",
-      "revision": "4168f45a16a1290d65a4ec0fa312ae917a4c15d6",
-      "filename": "Qwen_Qwen3.5-4B-Q4_K_M.gguf",
-      "sha256": "13c16f426047e2de38cd075bdade4a7bcbc8c774384876f677740cda65f8a983",
-      "api_base": "http://127.0.0.1:8002/v1",
-      "health_url": "http://127.0.0.1:8002/v1/models",
-      "memory_budget_gib": 6,
-      "exclusive": false,
-      "boot": false
-    },
-    "deepseek-v4-flash": {
-      "runtime": "ds4",
-      "service": "spark-ai-ds4.service",
-      "source": "antirez/deepseek-v4-gguf",
-      "revision": "e7f04037032990db0346398d249baf9fb9df1ccc",
-      "filename": "DeepSeek-V4-Flash-IQ2XXS-w2Q2K-AProjQ8-SExpQ8-OutQ8-chat-v2-imatrix-0731.gguf",
-      "sha256": "ca22ae2f838e14077c22bc1c1417b71b45b5e5a3687bd96c2ac6e17fdb6261c0",
-      "drafter_source": "bleysg/DeepSeek-V4-Flash-DSpark-drafter-GGUF",
-      "drafter_revision": "81c6fdd38f9582da45ba27f0ed7b63bcd3ea3b62",
-      "drafter_filename": "DSpark-drafter-Q2K-Q8-0731.gguf",
-      "drafter_sha256": "8fa269560dc76fd73e4233ad9b1938b5f65dd363381fd9b1a5c6183f7d12d686",
-      "api_base": "http://127.0.0.1:8003/v1",
-      "health_url": "http://127.0.0.1:8003/v1/models",
-      "memory_budget_gib": 109,
-      "exclusive": true,
-      "boot": false,
-      "restore_on_deactivate": "qwen3.6-35b"
-    }
-  }
-}
+# Model catalog — schema per docs/CONTRACTS.md §7.
+# Consumed by bin/modelctl (fetch/verify/activate) and, via /etc/spark-ai-stack/models.yaml
+# (a root-owned copy made by `sudo spark-ai-ctl sync`), by spark-ai-ctl backend-start.
+#
+# Experimental / non-mainline backends (ds4 native, forked llama.cpp) live in
+# config/experimental.yaml instead — they are never validated against this file's
+# concurrency rules and never started by the normal compose stack.
+
+schema_version: 2
+
+defaults:
+  host_reserve_gib: 10
+  health:
+    path: /v1/models
+    timeout_s: 1200
+
+models:
+  # -------------------------------------------------------------------------
+  # Boot model. Known-good vLLM invocation ported verbatim (flag-for-flag,
+  # minus host/port/served-model-name/model-path which the wrapper renders)
+  # from docs/legacy/vllm-playbook/start-vllm.sh.
+  # -------------------------------------------------------------------------
+  qwen3.6-35b:
+    backend: vllm
+    slot: primary
+    role: text
+    boot: true
+    budget_gib: 72
+    source:
+      hf_repo: nvidia/Qwen3.6-35B-A3B-NVFP4
+      revision: 491c2f1ea524c639598bf8fa787a93fed5a6fbce  # pinned, carried from old config/models.yaml + versions.lock.yaml
+    served_model_name: qwen3.6-35b
+    args:
+      - --tensor-parallel-size
+      - "1"
+      - --trust-remote-code
+      - --kv-cache-dtype
+      - bfloat16
+      - --attention-backend
+      - flashinfer
+      - --moe-backend
+      - marlin
+      - --kv-cache-memory-bytes
+      - 30G
+      - --max-model-len
+      - "262144"
+      - --max-num-seqs
+      - "4"
+      - --max-num-batched-tokens
+      - "8192"
+      - --enable-chunked-prefill
+      - --async-scheduling
+      - --enable-prefix-caching
+      - --speculative-config
+      - '{"method":"mtp","num_speculative_tokens":3,"moe_backend":"triton"}'
+      - --load-format
+      - fastsafetensors
+      - --reasoning-parser
+      - qwen3
+      - --enable-auto-tool-choice
+      - --tool-call-parser
+      - qwen3_coder
+    health:
+      timeout_s: 1200
+
+  qwen3.6-27b:
+    backend: vllm
+    slot: primary  # alternative to the boot model; only the vision model uses secondary
+    role: text
+    boot: false
+    budget_gib: 40
+    source:
+      hf_repo: nvidia/Qwen3.6-27B-NVFP4
+      revision: null  # pin at fetch time
+    served_model_name: qwen3.6-27b
+    args:
+      - --quantization
+      - modelopt
+      - --max-model-len
+      - "262144"
+      - --reasoning-parser
+      - qwen3
+
+  qwen3.8-27b:
+    backend: vllm
+    slot: secondary
+    role: vision
+    boot: false
+    budget_gib: 45
+    source:
+      hf_repo: unsloth/Qwen3.8-27B-NVFP4
+      revision: null  # pin at fetch time
+    served_model_name: qwen3.8-27b
+    # Baseline NVFP4 flags mirrored from qwen3.6-27b; vision-specific flags
+    # (e.g. --limit-mm-per-prompt, chat template) are NOT specified anywhere
+    # in CONTRACTS.md or the old catalog — see report, needs validation.
+    args:
+      - --quantization
+      - modelopt
+      - --trust-remote-code
+
+  nemotron-3.5-lightning-30b:
+    backend: vllm
+    slot: primary  # alternative to the boot model
+    role: text
+    boot: false
+    budget_gib: 40
+    source:
+      hf_repo: nvidia/NVIDIA-Nemotron-3.5-Lightning-30B-A3B-NVFP4
+      revision: null  # pin at fetch time
+      # Optional speculative-decoding draft mentioned in CONTRACTS.md §7 ("...-NVFP4-DSpark
+      # draft"). Exact draft repo id is NOT confirmed anywhere in CONTRACTS.md or the old
+      # catalog — this is a best-guess name following the DSpark naming convention used by
+      # deepseek-v4-flash's drafter. See report: needs confirmation before use.
+      draft_hf_repo: nvidia/NVIDIA-Nemotron-3.5-Lightning-30B-A3B-NVFP4-DSpark  # unconfirmed
+      draft_revision: null  # pin at fetch time
+    served_model_name: nemotron-3.5-lightning-30b
+    # Speculative-config CLI flag deliberately omitted: no known-good vLLM
+    # --speculative-config syntax pairing this draft has been validated yet.
+    args:
+      - --quantization
+      - modelopt
+      - --trust-remote-code
+
+  # -------------------------------------------------------------------------
+  # Local-GGUF model, effectively exclusive (budget_gib ~= whole machine).
+  # GGUF sha256/filenames + drafter pins carried over from the old
+  # config/models.yaml + config/versions.lock.yaml (schema 1, JSON-in-YAML).
+  # -------------------------------------------------------------------------
+  deepseek-v4-flash:
+    backend: llamacpp
+    slot: primary
+    role: text
+    boot: false
+    budget_gib: 100
+    source:
+      hf_repo: antirez/deepseek-v4-gguf
+      revision: e7f04037032990db0346398d249baf9fb9df1ccc
+      filename: DeepSeek-V4-Flash-IQ2XXS-w2Q2K-AProjQ8-SExpQ8-OutQ8-chat-v2-imatrix-0731.gguf
+      sha256: ca22ae2f838e14077c22bc1c1417b71b45b5e5a3687bd96c2ac6e17fdb6261c0
+      local_path: ~/ai-data/models/gguf/DeepSeek-V4-Flash-IQ2XXS-w2Q2K-AProjQ8-SExpQ8-OutQ8-chat-v2-imatrix-0731.gguf
+      # Optional speculative-decode drafter, pinned from the old catalog.
+      drafter:
+        hf_repo: bleysg/DeepSeek-V4-Flash-DSpark-drafter-GGUF
+        revision: 81c6fdd38f9582da45ba27f0ed7b63bcd3ea3b62
+        filename: DSpark-drafter-Q2K-Q8-0731.gguf
+        sha256: 8fa269560dc76fd73e4233ad9b1938b5f65dd363381fd9b1a5c6183f7d12d686
+        local_path: ~/ai-data/models/gguf/DSpark-drafter-Q2K-Q8-0731.gguf
+    served_model_name: deepseek-v4-flash
+    # Conservative starting invocation — the old setup ran this model under the
+    # native ds4 runtime, so there is no known-good llama-server config yet.
+    # Tune at first activation (ctx-size, drafter via --model-draft) and update.
+    args:
+      - --n-gpu-layers
+      - "999"
+      - --ctx-size
+      - "65536"
+      - --flash-attn
+      - "on"
+      - --jinja  # use the GGUF's chat template; needed for tool calls
+    health:
+      timeout_s: 1800  # large local GGUF w/ CPU+GPU offload; default 1200 likely too tight
+
+tested_pairs: []
