@@ -98,13 +98,11 @@ the coordinator / workstream B:
   (`http://127.0.0.1:3001` or `https://<tailnet-name>/grafana`) -- there is
   no automated "force change on first login" env var in grafana-oss to
   enforce this, it's a manual step.
-- If/when workstream B wants a generated password instead: add
-  `GRAFANA_ADMIN_PASSWORD` to the fixed key set in CONTRACTS sect 6, have
-  `secrets-init` generate it with `openssl rand` like the others, and have
-  `sync` derive `/etc/spark-ai-stack/env.d/grafana.env` containing
-  `GF_SECURITY_ADMIN_PASSWORD=<value>` -- mirroring how the other
-  per-service env files are derived. No change needed on this side once that
-  file exists; `compose/monitoring.yml` already picks it up.
+- `GRAFANA_ADMIN_PASSWORD` is part of the fixed secret key set: `sudo
+  spark-ai-ctl secrets-init` generates it and derives
+  `/etc/spark-ai-stack/env.d/grafana.env` containing
+  `GF_SECURITY_ADMIN_PASSWORD=<value>`. Re-run `secrets-init` (or `sync`)
+  after bootstrap and the admin/admin fallback above no longer applies.
 
 ## Image pinning -- integration note
 

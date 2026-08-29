@@ -35,23 +35,13 @@ WORKDIR /src
 RUN git clone https://github.com/ggml-org/llama.cpp.git . \
     && git checkout "${LLAMACPP_COMMIT}"
 
-# CUDA/GGML cmake flags. -DGGML_CUDA=ON, -DGGML_CUDA_F16=ON and
+# CUDA/GGML cmake flags. -DGGML_CUDA=ON and
 # -DCMAKE_CUDA_ARCHITECTURES=121 come from docs/CONTRACTS.md §4 verbatim; the rest
 # were found by inspecting ~/llama.cpp-qwen4exp/build/CMakeCache.txt (a local
 # from-source checkout built on this same box) and replicated here where they
 # differ from — or reinforce — the ggml/CMakeLists.txt defaults:
 #
 #  -DGGML_CUDA=ON                 required: enables the CUDA backend at all.
-#  -DGGML_CUDA_F16=ON             per CONTRACTS.md §4 — NOTE: this cmake option no
-#                                 longer exists in ggml/CMakeLists.txt / ggml-cuda's
-#                                 CMakeLists.txt at the pinned commit (confirmed
-#                                 against ~/llama.cpp-qwen4exp, which shares the same
-#                                 ggml-cuda backend code and has no such option
-#                                 either). cmake will emit "Manually-specified
-#                                 variables were not used by the project" and ignore
-#                                 it — harmless. Kept for CONTRACTS compliance; flag
-#                                 for removal once CONTRACTS.md is updated to match
-#                                 current llama.cpp (see report).
 #  -DCMAKE_CUDA_ARCHITECTURES=121 GB10 is sm_121 (Blackwell). Per
 #                                 ggml/src/ggml-cuda/CMakeLists.txt, NATIVE detection
 #                                 (GGML_NATIVE=ON, the ggml default, WITH a GPU
@@ -82,7 +72,6 @@ RUN git clone https://github.com/ggml-org/llama.cpp.git . \
 RUN cmake -S . -B build -G Ninja \
       -DCMAKE_BUILD_TYPE=Release \
       -DGGML_CUDA=ON \
-      -DGGML_CUDA_F16=ON \
       -DCMAKE_CUDA_ARCHITECTURES=121 \
       -DGGML_NATIVE=OFF \
       -DGGML_CUDA_FA=ON \

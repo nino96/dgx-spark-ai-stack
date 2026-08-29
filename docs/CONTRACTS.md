@@ -93,7 +93,7 @@ human gate; the wrapper is new privileged code and gets line-by-line review.
     + `apache-tvm-ffi==0.1.9` + `xgrammar==0.2.1` (known-good lineage currently running; see
     `docs/legacy/vllm-playbook/`). Tag `spark-ai/vllm:26.07-xg021`.
   - llamacpp: build from `compose/images/llamacpp/Dockerfile` — CUDA 13 devel base (aarch64),
-    llama.cpp pinned commit, `-DGGML_CUDA=ON -DGGML_CUDA_F16=ON -DCMAKE_CUDA_ARCHITECTURES=121`,
+    llama.cpp pinned commit, `-DGGML_CUDA=ON -DCMAKE_CUDA_ARCHITECTURES=121` (GGML_CUDA_F16 no longer exists upstream),
     runtime stage with `llama-server`. Tag `spark-ai/llamacpp:<commit-short>`.
   - sglang: `lmsysorg/sglang:spark` pinned by digest (experimental-tier backend).
   - litellm: `ghcr.io/berriai/litellm` (digest-pinned; version chosen at implementation time).
