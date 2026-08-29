@@ -3,7 +3,7 @@ set -euo pipefail
 
 duration="${SOAK_SECONDS:-1800}"
 interval="${SOAK_INTERVAL_SECONDS:-10}"
-reserve_kib=$((8 * 1024 * 1024))
+reserve_kib=$((10 * 1024 * 1024))  # config/models.yaml defaults.host_reserve_gib
 output="${SOAK_REPORT:-soak-$(date +%Y%m%dT%H%M%S).tsv}"
 start="$(date +%s)"
 end=$((start + duration))

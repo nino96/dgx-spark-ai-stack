@@ -1,5 +1,15 @@
 #!/usr/bin/env python3
-"""Transactional model lifecycle controller for spark-ai-stack."""
+"""User-side model lifecycle controller for spark-ai-stack.
+
+Reads config/models.yaml (+ config/experimental.yaml) from THIS repo checkout
+(the user-writable copy). All privileged actions (starting/stopping backend
+containers, re-rendering the LiteLLM config) go through `sudo -n
+spark-ai-ctl ...`, the root-owned wrapper described in docs/CONTRACTS.md §5.
+The wrapper independently validates against its own root-owned copy of the
+catalog under /etc/spark-ai-stack/ -- this program never reads /etc.
+
+See docs/CONTRACTS.md §9 for the full CLI contract.
+"""
 
 from __future__ import annotations
 
@@ -16,63 +26,110 @@ import subprocess
 import sys
 import tempfile
 import time
-from typing import Any, Iterable
+from typing import Any, Iterator
 import urllib.error
 import urllib.request
 
+import yaml
+
 
 ROOT = Path(__file__).resolve().parents[1]
+MODELS_FILE = ROOT / "config" / "models.yaml"
+EXPERIMENTAL_FILE = ROOT / "config" / "experimental.yaml"
+
 DATA_ROOT = Path(os.environ.get("SPARK_AI_DATA_ROOT", "~/ai-data")).expanduser()
 STATE_ROOT = DATA_ROOT / "state"
 GGUF_ROOT = DATA_ROOT / "models" / "gguf"
 HF_ROOT = DATA_ROOT / "huggingface"
-SECRETS_FILE = Path(
-    os.environ.get(
-        "SPARK_AI_SECRETS_FILE", "~/.config/spark-ai-stack/secrets.env"
-    )
-).expanduser()
-MODELS_FILE = ROOT / "config" / "models.yaml"
-CLOUD_MODELS_FILE = ROOT / "config" / "cloud-models.yaml"
-CONCURRENCY_FILE = ROOT / "config" / "concurrency.yaml"
+
 LOCK_FILE = STATE_ROOT / "modelctl.lock"
-STATE_FILE = STATE_ROOT / "active.json"
-ROUTES_FILE = STATE_ROOT / "litellm-config.yaml"
-COMPOSE_FILE = ROOT / "compose" / "compose.yml"
-PROJECT_NAME = "spark-ai-stack"
+ACTIVE_FILE = STATE_ROOT / "active.json"          # user-side mirror; wrapper's
+                                                   # /var/lib/spark-ai-stack/active.json is authoritative
+BASELINE_FILE = STATE_ROOT / "baseline.json"       # written by `doctor --capture-baseline`
+EVALS_STATE_ROOT = STATE_ROOT / "evals"
+
+SANITY_RUN = ROOT / "evals" / "sanity" / "run.py"
+LMEVAL_RUN = ROOT / "evals" / "lm-eval" / "run.sh"
+
+SLOT_PORTS = {"primary": 8001, "secondary": 8002}
+LLAMACPP_BACKENDS = {"llamacpp", "llamacpp-fork"}
+DEFAULT_HEALTH_PATH = "/v1/models"
+DEFAULT_TIMEOUTS_S = {"vllm": 1200, "llamacpp": 300, "llamacpp-fork": 300, "sglang": 900, "ds4": 1800}
+LITELLM_READY_URL = "http://127.0.0.1:4000/health/readiness"
+GATEWAY_READY_TIMEOUT_S = 120
+
+TEST_MODE = os.environ.get("SPARK_AI_TEST_MODE") == "1"
 
 
 class ModelctlError(RuntimeError):
     pass
 
 
-def load_json(path: Path) -> dict[str, Any]:
+# ---------------------------------------------------------------------------
+# Catalog loading
+# ---------------------------------------------------------------------------
+
+def load_yaml(path: Path) -> dict[str, Any]:
+    if not path.exists():
+        return {}
     with path.open("r", encoding="utf-8") as handle:
-        return json.load(handle)
+        return yaml.safe_load(handle) or {}
 
 
-CATALOG_DOC = load_json(MODELS_FILE)
-MODELS: dict[str, dict[str, Any]] = CATALOG_DOC["models"]
-CLOUD_MODELS: list[dict[str, str]] = load_json(CLOUD_MODELS_FILE)["models"]
-POLICY = load_json(CONCURRENCY_FILE)
-VERSIONS = load_json(ROOT / "config" / "versions.lock.yaml")
+def load_catalog(*, include_experimental: bool = True) -> dict[str, Any]:
+    """Load config/models.yaml (+ config/experimental.yaml) from the repo.
 
+    Both catalogs are always merged so lookups (fetch/verify/status/logs) work
+    regardless of --experimental; the flag itself only gates `activate`.
+    """
+    main = load_yaml(MODELS_FILE)
+    if not main.get("models"):
+        raise ModelctlError(f"no models defined in {MODELS_FILE}")
+    models: dict[str, dict[str, Any]] = {}
+    for name, spec in main["models"].items():
+        entry = dict(spec)
+        entry["experimental"] = False
+        models[name] = entry
+    if include_experimental:
+        experimental = load_yaml(EXPERIMENTAL_FILE)
+        for name, spec in (experimental.get("models") or {}).items():
+            entry = dict(spec)
+            entry["experimental"] = True
+            models[name] = entry
+    defaults = main.get("defaults") or {}
+    defaults.setdefault("host_reserve_gib", 10)
+    defaults.setdefault("health", {"path": DEFAULT_HEALTH_PATH, "timeout_s": 1200})
+    return {
+        "defaults": defaults,
+        "models": models,
+        "tested_pairs": main.get("tested_pairs") or [],
+    }
+
+
+def get_model(catalog: dict[str, Any], name: str) -> dict[str, Any]:
+    models = catalog["models"]
+    if name not in models:
+        raise ModelctlError(f"unknown model: {name!r}; see `modelctl catalog`")
+    return models[name]
+
+
+def boot_model_name(catalog: dict[str, Any]) -> str:
+    for name, model in catalog["models"].items():
+        if model.get("boot") and not model.get("experimental"):
+            return name
+    raise ModelctlError("no model has boot: true in config/models.yaml")
+
+
+# ---------------------------------------------------------------------------
+# State (user-side mirror) + locking
+# ---------------------------------------------------------------------------
 
 def utc_now() -> str:
     return dt.datetime.now(dt.timezone.utc).isoformat()
 
 
 def default_state() -> dict[str, Any]:
-    return {"schema": 1, "active": [], "default": None, "updated_at": utc_now()}
-
-
-def load_state() -> dict[str, Any]:
-    if not STATE_FILE.exists():
-        return default_state()
-    state = load_json(STATE_FILE)
-    state["active"] = [name for name in state.get("active", []) if name in MODELS]
-    if state.get("default") not in state["active"]:
-        state["default"] = state["active"][0] if state["active"] else None
-    return state
+    return {"schema": 1, "active": [], "updated_at": utc_now()}
 
 
 def atomic_write(path: Path, value: str, mode: int = 0o644) -> None:
@@ -90,117 +147,136 @@ def atomic_write(path: Path, value: str, mode: int = 0o644) -> None:
         temporary_path.unlink(missing_ok=True)
 
 
-def save_state(state: dict[str, Any]) -> None:
-    state = dict(state)
-    state["updated_at"] = utc_now()
-    atomic_write(STATE_FILE, json.dumps(state, indent=2, sort_keys=True) + "\n")
+def load_active_state() -> dict[str, Any]:
+    if not ACTIVE_FILE.exists():
+        return default_state()
+    try:
+        with ACTIVE_FILE.open("r", encoding="utf-8") as handle:
+            state = json.load(handle)
+    except (json.JSONDecodeError, OSError):
+        return default_state()
+    state.setdefault("active", [])
+    return state
+
+
+def save_active_state(active: list[str]) -> None:
+    state = {"schema": 1, "active": active, "updated_at": utc_now()}
+    atomic_write(ACTIVE_FILE, json.dumps(state, indent=2, sort_keys=True) + "\n")
 
 
 @contextlib.contextmanager
-def controller_lock() -> Iterable[None]:
+def controller_lock() -> Iterator[None]:
     STATE_ROOT.mkdir(parents=True, exist_ok=True)
     with LOCK_FILE.open("a+", encoding="utf-8") as lock_handle:
         fcntl.flock(lock_handle, fcntl.LOCK_EX)
         yield
 
 
-def command_env() -> dict[str, str]:
-    env = os.environ.copy()
-    env["SPARK_AI_DATA_ROOT"] = str(DATA_ROOT)
-    env["SPARK_AI_SECRETS_FILE"] = str(SECRETS_FILE)
-    return env
+# ---------------------------------------------------------------------------
+# Memory accounting (/proc/meminfo; no NVML on GB10 per CONTRACTS.md)
+# ---------------------------------------------------------------------------
+
+def meminfo() -> dict[str, int]:
+    """Return /proc/meminfo fields in bytes."""
+    values: dict[str, int] = {}
+    with Path("/proc/meminfo").open("r", encoding="utf-8") as handle:
+        for line in handle:
+            key, _, raw = line.partition(":")
+            fields = raw.strip().split()
+            if fields and fields[0].isdigit():
+                values[key] = int(fields[0]) * 1024
+    return values
 
 
-def run(
-    command: list[str], *, check: bool = True, capture: bool = False
-) -> subprocess.CompletedProcess[str]:
-    if os.environ.get("SPARK_AI_TEST_MODE") == "1":
-        return subprocess.CompletedProcess(command, 0, "", "")
-    return subprocess.run(
-        command,
-        check=check,
-        text=True,
-        capture_output=capture,
-        env=command_env(),
-    )
+def mem_available_gib() -> float:
+    return meminfo().get("MemAvailable", 0) / 1024**3
 
 
-def compose(*arguments: str, check: bool = True) -> subprocess.CompletedProcess[str]:
-    return run(
-        [
-            "docker",
-            "compose",
-            "--project-name",
-            PROJECT_NAME,
-            "--project-directory",
-            str(ROOT / "compose"),
-            "--file",
-            str(COMPOSE_FILE),
-            *arguments,
-        ],
-        check=check,
-    )
-
-
-def systemctl(*arguments: str, check: bool = True) -> subprocess.CompletedProcess[str]:
-    return run(["systemctl", "--user", *arguments], check=check)
-
-
-def backend_start(name: str) -> None:
-    runtime = MODELS[name]["runtime"]
-    if runtime == "vllm":
-        compose("--profile", "models", "up", "-d", "--build", "vllm")
-    elif runtime in {"llama_cpp", "ds4"}:
-        systemctl("start", MODELS[name]["service"])
-    else:
-        raise ModelctlError(f"Unsupported runtime for {name}: {runtime}")
-
-
-def backend_stop(name: str) -> None:
-    runtime = MODELS[name]["runtime"]
-    if runtime == "vllm":
-        compose("stop", "vllm", check=False)
-    elif runtime in {"llama_cpp", "ds4"}:
-        systemctl("stop", MODELS[name]["service"], check=False)
-
-
-def url_ok(url: str, timeout: float = 2.0) -> bool:
+def load_baseline() -> dict[str, Any] | None:
+    if not BASELINE_FILE.exists():
+        return None
     try:
-        with urllib.request.urlopen(url, timeout=timeout) as response:
-            return 200 <= response.status < 300
-    except (urllib.error.URLError, TimeoutError, ConnectionError):
-        return False
+        with BASELINE_FILE.open("r", encoding="utf-8") as handle:
+            return json.load(handle)
+    except (json.JSONDecodeError, OSError):
+        return None
 
 
-def wait_healthy(name: str) -> None:
-    timeout = int(MODELS[name].get("health_timeout_seconds", 0))
-    if not timeout:
-        timeout = {"vllm": 1200, "ds4": 1800, "llama_cpp": 300}.get(
-            MODELS[name]["runtime"], 300
-        )
-    if os.environ.get("SPARK_AI_TEST_MODE") == "1":
-        return
-    deadline = time.monotonic() + timeout
-    while time.monotonic() < deadline:
-        if url_ok(MODELS[name]["health_url"], timeout=3):
-            return
-        time.sleep(3)
-    raise ModelctlError(f"{name} did not become healthy within {timeout} seconds")
+def effective_available_gib(current_active: list[str], catalog: dict[str, Any]) -> float:
+    """Best-effort estimate of MemAvailable at idle (no models running).
 
-
-def repo_cache_name(repository: str) -> str:
-    return "models--" + repository.replace("/", "--")
-
-
-def hf_snapshot(model: dict[str, Any], source_key: str = "source", revision_key: str = "revision") -> Path:
-    return (
-        HF_ROOT
-        / "hub"
-        / repo_cache_name(model[source_key])
-        / "snapshots"
-        / model[revision_key]
+    Prefers the baseline captured by `doctor --capture-baseline`; falls back
+    to current MemAvailable plus the declared budgets of whatever is already
+    active (since a reconfiguration will free that memory back up).
+    """
+    baseline = load_baseline()
+    if baseline and "mem_available_gib" in baseline:
+        return float(baseline["mem_available_gib"])
+    already_active_budget = sum(
+        float(catalog["models"][name]["budget_gib"])
+        for name in current_active
+        if name in catalog["models"] and catalog["models"][name].get("budget_gib") is not None
     )
+    return mem_available_gib() + already_active_budget
 
+
+# ---------------------------------------------------------------------------
+# Concurrency rule (CONTRACTS.md §7)
+# ---------------------------------------------------------------------------
+
+def pair_in_tested_pairs(names: list[str], catalog: dict[str, Any]) -> bool:
+    wanted = sorted(names)
+    for entry in catalog.get("tested_pairs", []):
+        candidate = entry.get("models") if isinstance(entry, dict) else entry
+        if candidate and sorted(candidate) == wanted:
+            if not isinstance(entry, dict) or entry.get("status", "passed") == "passed":
+                return True
+    return False
+
+
+def validate_concurrency(names: list[str], catalog: dict[str, Any]) -> None:
+    if len(names) <= 1:
+        return
+    if len(names) > 2:
+        raise ModelctlError("at most two models (primary + secondary) may be active at once")
+    first, second = names
+    model_a = get_model(catalog, first)
+    model_b = get_model(catalog, second)
+    if model_a["slot"] == model_b["slot"]:
+        raise ModelctlError(
+            f"{first} and {second} both use slot {model_a['slot']!r}; two models must not share a slot"
+        )
+    if model_a["role"] == model_b["role"] and not pair_in_tested_pairs(names, catalog):
+        raise ModelctlError(
+            f"{first} and {second} share role {model_a['role']!r} and are not in "
+            "config/models.yaml `tested_pairs:` (soak-gated allowlist)"
+        )
+
+
+def check_budget(desired: list[str], current_active: list[str], catalog: dict[str, Any]) -> None:
+    reserve = float(catalog["defaults"]["host_reserve_gib"])
+    budgets = []
+    for name in desired:
+        model = get_model(catalog, name)
+        budget = model.get("budget_gib")
+        if budget is None:
+            raise ModelctlError(
+                f"{name} has no budget_gib set in the catalog; cannot budget-check activation"
+            )
+        budgets.append(float(budget))
+    total_budget = sum(budgets)
+    available = effective_available_gib(current_active, catalog)
+    if total_budget + reserve > available:
+        raise ModelctlError(
+            f"budget check failed: sum(budget_gib)={total_budget:.1f} GiB + "
+            f"host_reserve_gib={reserve:.1f} GiB > estimated available {available:.1f} GiB"
+        )
+
+
+# ---------------------------------------------------------------------------
+# Artifact verification (sha256 of local GGUF paths; hf-repo models are
+# skipped -- vllm/sglang pull from their own HF cache).
+# ---------------------------------------------------------------------------
 
 def sha256_file(path: Path) -> str:
     digest = hashlib.sha256()
@@ -210,489 +286,625 @@ def sha256_file(path: Path) -> str:
     return digest.hexdigest()
 
 
-def verify_one(name: str) -> dict[str, Any]:
-    if name not in MODELS:
-        raise ModelctlError(f"Unknown model: {name}")
-    model = MODELS[name]
+def verify_one(name: str, catalog: dict[str, Any]) -> dict[str, Any]:
+    model = get_model(catalog, name)
+    source = model.get("source", {})
     result: dict[str, Any] = {"model": name, "ok": True, "checks": []}
 
     def record(check: str, ok: bool, detail: str) -> None:
         result["checks"].append({"check": check, "ok": ok, "detail": detail})
         result["ok"] = result["ok"] and ok
 
-    if model["runtime"] == "vllm":
-        snapshot = hf_snapshot(model)
-        record("revision", snapshot.is_dir(), str(snapshot))
+    if "local_path" in source:
+        path = Path(source["local_path"]).expanduser()
+        exists = path.is_file()
+        record("artifact", exists, str(path))
+        if exists:
+            actual = sha256_file(path)
+            record("sha256", actual == source.get("sha256"), actual)
+        drafter = source.get("drafter")
+        if drafter:
+            dpath = Path(drafter["local_path"]).expanduser()
+            dexists = dpath.is_file()
+            record("drafter_artifact", dexists, str(dpath))
+            if dexists:
+                dactual = sha256_file(dpath)
+                record("drafter_sha256", dactual == drafter.get("sha256"), dactual)
+    elif "hf_repo" in source:
+        revision = source.get("revision")
+        if revision is None:
+            record("revision_pinned", False, "revision is null (pin at fetch time)")
+        else:
+            snapshot = hf_snapshot_dir(source["hf_repo"], revision)
+            record("hf_snapshot", snapshot.is_dir(), str(snapshot))
     else:
-        artifact = GGUF_ROOT / model["filename"]
-        exists = artifact.is_file()
-        record("artifact", exists, str(artifact))
-        if exists:
-            actual = sha256_file(artifact)
-            record("sha256", actual == model["sha256"], actual)
-
-    if model["runtime"] == "llama_cpp":
-        binary = DATA_ROOT / "builds" / "llama.cpp" / "bin" / "llama-server"
-        record("binary", os.access(binary, os.X_OK), str(binary))
-        source = DATA_ROOT / "src" / "llama.cpp"
-        commit = git_commit(source)
-        record("source_commit", commit == VERSIONS["sources"]["llama_cpp"]["commit"], commit or str(source))
-    elif model["runtime"] == "ds4":
-        drafter = GGUF_ROOT / model["drafter_filename"]
-        exists = drafter.is_file()
-        record("drafter", exists, str(drafter))
-        if exists:
-            actual = sha256_file(drafter)
-            record("drafter_sha256", actual == model["drafter_sha256"], actual)
-        source = DATA_ROOT / "src" / "ds4"
-        commit = git_commit(source)
-        record(
-            "source_commit",
-            commit == VERSIONS["sources"]["ds4"]["commit"],
-            commit or str(source),
-        )
-        binary = source / "ds4-server"
-        record("binary", os.access(binary, os.X_OK), str(binary))
+        record("source", False, f"model {name} has neither local_path nor hf_repo in source")
     return result
 
 
-def git_commit(path: Path) -> str | None:
-    if not (path / ".git").exists():
-        return None
-    completed = run(
-        ["git", "-C", str(path), "rev-parse", "HEAD"], check=False, capture=True
-    )
-    return completed.stdout.strip() if completed.returncode == 0 else None
+def hf_repo_cache_name(repo_id: str) -> str:
+    return "models--" + repo_id.replace("/", "--")
 
 
-def hf_command() -> str:
-    candidates = [
-        DATA_ROOT / "tools" / "hf" / "bin" / "hf",
-        Path(shutil.which("hf") or ""),
-    ]
-    for candidate in candidates:
-        if str(candidate) and candidate.is_file():
-            return str(candidate)
-    raise ModelctlError("hf CLI is missing; run bin/stack apply first")
+def hf_snapshot_dir(repo_id: str, revision: str) -> Path:
+    return HF_ROOT / "hub" / hf_repo_cache_name(repo_id) / "snapshots" / revision
 
 
-def fetch_one(name: str) -> None:
-    model = MODELS.get(name)
-    if not model:
-        raise ModelctlError(f"Unknown model: {name}")
-    base = [hf_command(), "download"]
-    env = command_env()
-    env["HF_HOME"] = str(HF_ROOT)
-    env["HF_HUB_CACHE"] = str(HF_ROOT / "hub")
-
-    def download(repository: str, revision: str, filename: str | None = None) -> None:
-        command = [*base, repository]
-        if filename:
-            command.append(filename)
-        command.extend(["--revision", revision])
-        if filename:
-            command.extend(["--local-dir", str(GGUF_ROOT)])
-        if os.environ.get("SPARK_AI_TEST_MODE") != "1":
-            subprocess.run(command, check=True, env=env)
-
-    GGUF_ROOT.mkdir(parents=True, exist_ok=True)
-    HF_ROOT.mkdir(parents=True, exist_ok=True)
-    if model["runtime"] == "vllm":
-        download(model["source"], model["revision"])
-    elif model["runtime"] == "llama_cpp":
-        download(model["source"], model["revision"], model["filename"])
-    elif model["runtime"] == "ds4":
-        download(model["source"], model["revision"], model["filename"])
-        download(
-            model["drafter_source"],
-            model["drafter_revision"],
-            model["drafter_filename"],
-        )
-    result = verify_one(name)
-    if not result["ok"]:
-        raise ModelctlError(f"Downloaded artifacts did not verify: {json.dumps(result)}")
-
-
-def meminfo() -> dict[str, int]:
-    values: dict[str, int] = {}
-    with Path("/proc/meminfo").open("r", encoding="utf-8") as handle:
-        for line in handle:
-            key, raw = line.split(":", 1)
-            fields = raw.strip().split()
-            if fields and fields[0].isdigit():
-                values[key] = int(fields[0]) * 1024
-    return values
-
-
-def pair_allowed(names: list[str]) -> bool:
-    if len(names) < 2:
-        return True
-    wanted = sorted(names)
-    for entry in POLICY.get("tested_allowlist", []):
-        if sorted(entry["models"]) == wanted and entry.get("status") == "passed":
-            return True
-    return False
-
-
-def desired_activation(current: list[str], target: str) -> list[str]:
-    model = MODELS[target]
-    if model.get("exclusive"):
-        return [target]
-    candidates = [
-        name
-        for name in current
-        if name != target and not MODELS[name].get("exclusive")
-    ] + [target]
-    # Pending/unlisted combinations behave exclusively; they are never silently
-    # run together just because both processes happen to fit at idle.
-    if not pair_allowed(candidates):
-        return [target]
-    return sorted(set(candidates), key=candidates.index)
-
-
-def check_budget(names: list[str], *, check_available: bool) -> None:
-    info = meminfo()
-    gib = 1024**3
-    reserve = float(POLICY["host_reserve_gib"])
-    budget = sum(float(MODELS[name]["memory_budget_gib"]) for name in names)
-    total = info["MemTotal"] / gib
-    if budget + reserve > total:
-        raise ModelctlError(
-            f"Declared {budget:.1f} GiB + {reserve:.1f} GiB reserve exceeds "
-            f"{total:.1f} GiB physical memory"
-        )
-    if check_available:
-        available = info.get("MemAvailable", 0) / gib
-        if available < budget + reserve:
-            raise ModelctlError(
-                f"Only {available:.1f} GiB is available; activation requires "
-                f"{budget:.1f} GiB + {reserve:.1f} GiB reserve"
-            )
-
-
-def yaml_string(value: str) -> str:
-    return json.dumps(value)
-
-
-def configured_secret_names() -> set[str]:
-    names: set[str] = set()
-    try:
-        content = SECRETS_FILE.read_text(encoding="utf-8")
-    except OSError:
-        return names
-    for line in content.splitlines():
-        key, separator, value = line.partition("=")
-        if separator and value:
-            names.add(key)
-    return names
-
-
-def render_routes(
-    active: list[str], default: str | None, available_secrets: set[str] | None = None
-) -> str:
-    lines = ["# Generated by bin/modelctl; do not edit.", "model_list:"]
-    has_model = False
-    for name in active:
-        has_model = True
-        model = MODELS[name]
-        lines.extend(
-            [
-                f"  - model_name: {yaml_string(name)}",
-                "    litellm_params:",
-                f"      model: {yaml_string('openai/' + name)}",
-                f"      api_base: {yaml_string(model['api_base'])}",
-                '      api_key: "not-needed"',
-            ]
-        )
-    if default:
-        has_model = True
-        model = MODELS[default]
-        lines.extend(
-            [
-                '  - model_name: "local/default"',
-                "    litellm_params:",
-                f"      model: {yaml_string('openai/' + default)}",
-                f"      api_base: {yaml_string(model['api_base'])}",
-                '      api_key: "not-needed"',
-            ]
-        )
-    if available_secrets is None:
-        available_secrets = configured_secret_names()
-    for model in CLOUD_MODELS:
-        if model["api_key_env"] not in available_secrets:
+def verify_activation_artifacts(names: list[str], catalog: dict[str, Any]) -> None:
+    """Verify gguf-sourced artifacts only; hf-repo (vllm/sglang) models are
+    skipped here per CONTRACTS.md §9 -- the backend pulls from its own cache."""
+    failures = []
+    for name in names:
+        model = get_model(catalog, name)
+        if "local_path" not in model.get("source", {}):
             continue
-        has_model = True
-        lines.extend(
-            [
-                f"  - model_name: {yaml_string(model['name'])}",
-                "    litellm_params:",
-                f"      model: {yaml_string(model['provider_model'])}",
-                f"      api_key: {yaml_string('os.environ/' + model['api_key_env'])}",
-            ]
-        )
-    if not has_model:
-        lines[-1] = "model_list: []"
-    lines.extend(
-        [
-            "general_settings:",
-            '  master_key: "os.environ/LITELLM_MASTER_KEY"',
-            "  disable_spend_logs: false",
-            "litellm_settings:",
-            "  drop_params: true",
-            "  request_timeout: 600",
-            "",
-        ]
-    )
-    return "\n".join(lines)
+        result = verify_one(name, catalog)
+        if not result["ok"]:
+            failures.append(result)
+    if failures:
+        raise ModelctlError(f"artifact verification failed before activation: {json.dumps(failures)}")
+
+
+# ---------------------------------------------------------------------------
+# Privileged calls via `sudo -n spark-ai-ctl ...`
+# ---------------------------------------------------------------------------
+
+def run_sudo_ctl(args: list[str], *, check: bool = True) -> subprocess.CompletedProcess[str]:
+    if TEST_MODE:
+        return subprocess.CompletedProcess(["sudo", "-n", "spark-ai-ctl", *args], 0, "", "")
+    command = ["sudo", "-n", "spark-ai-ctl", *args]
+    try:
+        completed = subprocess.run(command, text=True, capture_output=True)
+    except FileNotFoundError as error:
+        raise ModelctlError(
+            f"could not exec {command[0]}: {error}. Is sudo installed and spark-ai-ctl on PATH?"
+        ) from error
+    if completed.returncode != 0 and check:
+        stderr = (completed.stderr or completed.stdout or "").strip()
+        hint = ""
+        if "password is required" in stderr.lower() or "a terminal is required" in stderr.lower():
+            hint = (
+                " -- sudo -n failed; the NOPASSWD sudoers rule for spark-ai-ctl is probably "
+                "not installed yet. Run `sparkctl bootstrap` (or `sudo ./bootstrap.sh`) first."
+            )
+        raise ModelctlError(f"spark-ai-ctl {' '.join(args)} failed: {stderr}{hint}")
+    return completed
+
+
+def backend_start(name: str, *, experimental: bool) -> None:
+    args = ["backend-start", name]
+    if experimental:
+        args.append("--experimental")
+    run_sudo_ctl(args)
+
+
+def backend_stop(name: str, *, check: bool = True) -> None:
+    run_sudo_ctl(["backend-stop", name], check=check)
 
 
 def gateway_reload() -> None:
-    compose("up", "-d", "litellm")
-    compose("restart", "litellm")
-    if os.environ.get("SPARK_AI_TEST_MODE") == "1":
+    run_sudo_ctl(["gateway-reload"])
+
+
+# ---------------------------------------------------------------------------
+# HTTP health polling
+# ---------------------------------------------------------------------------
+
+def url_ok(url: str, timeout: float = 2.0) -> bool:
+    try:
+        with urllib.request.urlopen(url, timeout=timeout) as response:
+            return 200 <= response.status < 300
+    except (urllib.error.URLError, TimeoutError, ConnectionError, ValueError):
+        return False
+
+
+def health_url(model: dict[str, Any]) -> str:
+    port = SLOT_PORTS[model["slot"]]
+    if model["backend"] in LLAMACPP_BACKENDS:
+        path = "/health"
+    else:
+        path = (model.get("health") or {}).get("path", DEFAULT_HEALTH_PATH)
+    return f"http://127.0.0.1:{port}{path}"
+
+
+def health_timeout_s(model: dict[str, Any]) -> int:
+    configured = (model.get("health") or {}).get("timeout_s")
+    if configured:
+        return int(configured)
+    return DEFAULT_TIMEOUTS_S.get(model["backend"], 600)
+
+
+def wait_healthy(name: str, model: dict[str, Any]) -> None:
+    if TEST_MODE:
         return
-    deadline = time.monotonic() + 120
+    timeout = health_timeout_s(model)
+    url = health_url(model)
+    deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
-        if url_ok("http://127.0.0.1:4000/health/readiness", timeout=3):
+        if url_ok(url, timeout=3):
+            return
+        time.sleep(3)
+    raise ModelctlError(f"{name} did not become healthy within {timeout}s at {url}")
+
+
+def wait_gateway_ready() -> None:
+    if TEST_MODE:
+        return
+    deadline = time.monotonic() + GATEWAY_READY_TIMEOUT_S
+    while time.monotonic() < deadline:
+        if url_ok(LITELLM_READY_URL, timeout=3):
             return
         time.sleep(2)
-    raise ModelctlError("LiteLLM did not become ready after the route update")
+    raise ModelctlError(f"litellm did not report ready at {LITELLM_READY_URL} after gateway-reload")
 
 
-def install_routes(active: list[str], default: str | None, restart: bool) -> None:
-    atomic_write(ROUTES_FILE, render_routes(active, default))
-    if restart:
-        gateway_reload()
+# ---------------------------------------------------------------------------
+# Sanity gate (evals/sanity/run.py, CONTRACTS.md §10)
+# ---------------------------------------------------------------------------
+
+def run_sanity(name: str, model: dict[str, Any], *, full: bool) -> None:
+    if not SANITY_RUN.is_file():
+        print(
+            f"modelctl: {SANITY_RUN} not found (evals workstream not implemented yet); "
+            "skipping sanity gate",
+            file=sys.stderr,
+        )
+        return
+    port = SLOT_PORTS[model["slot"]]
+    command = [
+        sys.executable,
+        str(SANITY_RUN),
+        "--api-base",
+        f"http://127.0.0.1:{port}/v1",
+        "--model",
+        model["served_model_name"],
+    ]
+    if model.get("role") == "vision":
+        command += ["--role", "vision"]
+    if full:
+        command.append("--long-context")
+    if TEST_MODE:
+        return
+    completed = subprocess.run(command, text=True, capture_output=True)
+    if completed.returncode != 0:
+        raise ModelctlError(
+            f"sanity check failed for {name} (exit {completed.returncode}): "
+            f"{(completed.stdout + completed.stderr)[-2000:]}"
+        )
 
 
-def transition(active: list[str], default: str | None, *, verify: bool = True) -> dict[str, Any]:
-    previous = load_state()
-    previous_routes = ROUTES_FILE.read_text(encoding="utf-8") if ROUTES_FILE.exists() else None
-    if default not in active:
-        default = active[0] if active else None
-    check_budget(active, check_available=False)
-    if verify:
-        failures = [verify_one(name) for name in active]
-        failures = [result for result in failures if not result["ok"]]
-        if failures:
-            raise ModelctlError(f"Artifact verification failed: {json.dumps(failures)}")
+# ---------------------------------------------------------------------------
+# Activation transaction (transactional, with rollback)
+# ---------------------------------------------------------------------------
 
-    stopped = [name for name in previous["active"] if name not in active]
-    started = [name for name in active if name not in previous["active"]]
-    try:
-        for name in stopped:
-            backend_stop(name)
-        if stopped and os.environ.get("SPARK_AI_TEST_MODE") != "1":
-            time.sleep(3)
-        check_budget(active, check_available=True)
-        # Reconcile every desired backend. Persisted active state survives a
-        # reboot, but native units and stopped containers might not be running.
-        for name in active:
-            backend_start(name)
-            wait_healthy(name)
-        install_routes(active, default, restart=True)
-        state = {"schema": 1, "active": active, "default": default}
-        save_state(state)
-        return load_state()
-    except Exception as original:
-        for name in started:
-            backend_stop(name)
-        rollback_errors: list[str] = []
-        for name in previous["active"]:
-            try:
-                backend_start(name)
-                wait_healthy(name)
-            except Exception as rollback_error:  # best-effort but reported
-                rollback_errors.append(f"{name}: {rollback_error}")
-        try:
-            if previous_routes is None:
-                ROUTES_FILE.unlink(missing_ok=True)
-            else:
-                atomic_write(ROUTES_FILE, previous_routes)
-            gateway_reload()
-            save_state(previous)
-        except Exception as rollback_error:
-            rollback_errors.append(f"gateway/state: {rollback_error}")
-        suffix = f"; rollback errors: {rollback_errors}" if rollback_errors else ""
-        raise ModelctlError(f"Activation failed and previous state was restored: {original}{suffix}") from original
+def activate(
+    name: str,
+    *,
+    with_name: str | None = None,
+    experimental: bool = False,
+    skip_sanity: bool = False,
+) -> dict[str, Any]:
+    catalog = load_catalog()
+    desired = [name] + ([with_name] if with_name else [])
+    seen = set()
+    for model_name in desired:
+        model = get_model(catalog, model_name)
+        if model.get("experimental") and not experimental:
+            raise ModelctlError(
+                f"{model_name} is experimental; pass --experimental to activate it"
+            )
+        if model_name in seen:
+            raise ModelctlError(f"{model_name!r} was named twice")
+        seen.add(model_name)
 
-
-def activate(name: str, make_default: bool) -> dict[str, Any]:
-    if name not in MODELS:
-        raise ModelctlError(f"Unknown model: {name}")
     with controller_lock():
-        current = load_state()
-        desired = desired_activation(current["active"], name)
-        default = name if make_default or MODELS[name].get("exclusive") else current["default"]
-        if default not in desired:
-            default = name
-        return transition(desired, default)
+        validate_concurrency(desired, catalog)
+        previous = load_active_state()
+        previous_active = list(previous.get("active", []))
+        check_budget(desired, previous_active, catalog)
+        verify_activation_artifacts(desired, catalog)
+
+        to_stop = [entry for entry in previous_active if entry not in desired]
+        to_start = [entry for entry in desired if entry not in previous_active]
+        started: list[str] = []
+        try:
+            for entry in to_stop:
+                backend_stop(entry, check=False)
+            for entry in to_start:
+                is_experimental = get_model(catalog, entry).get("experimental", False)
+                backend_start(entry, experimental=is_experimental)
+                started.append(entry)
+            for entry in desired:
+                wait_healthy(entry, get_model(catalog, entry))
+            if not skip_sanity:
+                for entry in desired:
+                    run_sanity(entry, get_model(catalog, entry), full=False)
+            gateway_reload()
+            wait_gateway_ready()
+            save_active_state(desired)
+            return {"active": desired, "previous": previous_active}
+        except Exception as original:  # noqa: BLE001 - transactional rollback boundary
+            rollback_errors: list[str] = []
+            for entry in started:
+                try:
+                    backend_stop(entry, check=False)
+                except Exception as stop_error:  # noqa: BLE001
+                    rollback_errors.append(f"stop {entry}: {stop_error}")
+            for entry in previous_active:
+                try:
+                    is_experimental = catalog["models"].get(entry, {}).get("experimental", False)
+                    backend_start(entry, experimental=is_experimental)
+                    wait_healthy(entry, get_model(catalog, entry))
+                except Exception as restart_error:  # noqa: BLE001
+                    rollback_errors.append(f"restart {entry}: {restart_error}")
+            try:
+                gateway_reload()
+                save_active_state(previous_active)
+            except Exception as gateway_error:  # noqa: BLE001
+                rollback_errors.append(f"gateway/state: {gateway_error}")
+            suffix = f"; rollback errors: {rollback_errors}" if rollback_errors else "; rollback ok"
+            raise ModelctlError(f"activation of {desired} failed and was rolled back: {original}{suffix}") from original
 
 
 def deactivate(name: str) -> dict[str, Any]:
-    if name not in MODELS:
-        raise ModelctlError(f"Unknown model: {name}")
+    catalog = load_catalog()
     with controller_lock():
-        current = load_state()
-        desired = [entry for entry in current["active"] if entry != name]
-        if MODELS[name].get("restore_on_deactivate") and name in current["active"]:
-            desired = [MODELS[name]["restore_on_deactivate"]]
-        default = current["default"] if current["default"] in desired else None
-        if desired and default is None:
-            default = desired[0]
-        return transition(desired, default)
+        previous = load_active_state()
+        previous_active = list(previous.get("active", []))
+        if name == "all":
+            desired: list[str] = []
+        else:
+            get_model(catalog, name)  # validates existence
+            desired = [entry for entry in previous_active if entry != name]
+        to_stop = [entry for entry in previous_active if entry not in desired]
+        for entry in to_stop:
+            backend_stop(entry, check=False)
+        gateway_reload()
+        wait_gateway_ready()
+        save_active_state(desired)
+        return {"active": desired, "previous": previous_active}
 
 
-def status() -> dict[str, Any]:
-    state = load_state()
-    return {
-        **state,
-        "models": {
-            name: {
-                "configured_active": name in state["active"],
-                "healthy": url_ok(model["health_url"], timeout=0.5),
-                "runtime": model["runtime"],
-                "api_base": model["api_base"],
+def ensure_boot() -> dict[str, Any]:
+    catalog = load_catalog()
+    boot_name = boot_model_name(catalog)
+    state = load_active_state()
+    active = state.get("active", [])
+    if active and all(url_ok(health_url(get_model(catalog, entry)), timeout=1) for entry in active):
+        return {"already_healthy": True, "active": active}
+    return activate(boot_name)
+
+
+# ---------------------------------------------------------------------------
+# fetch / verify / catalog / status / logs
+# ---------------------------------------------------------------------------
+
+def hf_download_available() -> bool:
+    try:
+        import huggingface_hub  # noqa: F401
+        return True
+    except ImportError:
+        return False
+
+
+def hf_cli_path() -> str:
+    path = shutil.which("hf") or shutil.which("huggingface-cli")
+    if not path:
+        raise ModelctlError(
+            "neither the huggingface_hub python package nor the `hf`/`huggingface-cli` "
+            "command is available; install huggingface_hub to fetch models"
+        )
+    return path
+
+
+def fetch_snapshot(repo_id: str, revision: str | None) -> str:
+    """Download a full HF repo snapshot for hf_repo-sourced models (vllm/sglang).
+    Returns the resolved revision."""
+    HF_ROOT.mkdir(parents=True, exist_ok=True)
+    if TEST_MODE:
+        return revision or "test-revision"
+    if hf_download_available():
+        from huggingface_hub import HfApi, snapshot_download
+
+        resolved = revision
+        if resolved is None:
+            resolved = HfApi().model_info(repo_id).sha
+        snapshot_download(repo_id=repo_id, revision=resolved, cache_dir=str(HF_ROOT / "hub"))
+        return resolved
+    command = [hf_cli_path(), "download", repo_id]
+    if revision:
+        command += ["--revision", revision]
+    env = os.environ.copy()
+    env["HF_HOME"] = str(HF_ROOT)
+    env["HF_HUB_CACHE"] = str(HF_ROOT / "hub")
+    subprocess.run(command, check=True, env=env)
+    return revision or "latest (unresolved -- pin manually, see huggingface_hub logs)"
+
+
+def fetch_gguf_file(repo_id: str, revision: str, filename: str, expected_sha256: str) -> None:
+    GGUF_ROOT.mkdir(parents=True, exist_ok=True)
+    target = GGUF_ROOT / filename
+    if TEST_MODE:
+        return
+    if hf_download_available():
+        from huggingface_hub import hf_hub_download
+
+        downloaded = hf_hub_download(
+            repo_id=repo_id, filename=filename, revision=revision, local_dir=str(GGUF_ROOT)
+        )
+        target = Path(downloaded)
+    else:
+        command = [hf_cli_path(), "download", repo_id, filename, "--revision", revision, "--local-dir", str(GGUF_ROOT)]
+        env = os.environ.copy()
+        env["HF_HOME"] = str(HF_ROOT)
+        subprocess.run(command, check=True, env=env)
+    if target.is_file():
+        actual = sha256_file(target)
+        if actual != expected_sha256:
+            raise ModelctlError(
+                f"downloaded {target} has sha256 {actual}, expected {expected_sha256}"
+            )
+
+
+def fetch_one(name: str, catalog: dict[str, Any]) -> dict[str, Any]:
+    model = get_model(catalog, name)
+    source = model.get("source", {})
+    if "local_path" in source:
+        fetch_gguf_file(source["hf_repo"], source["revision"], source["filename"], source["sha256"])
+        drafter = source.get("drafter")
+        if drafter:
+            fetch_gguf_file(drafter["hf_repo"], drafter["revision"], drafter["filename"], drafter["sha256"])
+        return {"model": name, "fetched": True, "kind": "gguf"}
+    if "hf_repo" in source:
+        resolved = fetch_snapshot(source["hf_repo"], source.get("revision"))
+        message = None
+        if source.get("revision") is None:
+            message = (
+                f"resolved revision={resolved}; pin it in config/models.yaml "
+                f"(source.revision) for {name} before relying on this download"
+            )
+            print(f"modelctl: {message}", file=sys.stderr)
+        return {"model": name, "fetched": True, "kind": "hf_repo", "resolved_revision": resolved, "note": message}
+    raise ModelctlError(f"model {name} has no fetchable source")
+
+
+def installed_one(name: str, catalog: dict[str, Any]) -> bool:
+    model = get_model(catalog, name)
+    source = model.get("source", {})
+    if "local_path" in source:
+        path = Path(source["local_path"]).expanduser()
+        drafter = source.get("drafter")
+        drafter_ok = True
+        if drafter:
+            drafter_ok = Path(drafter["local_path"]).expanduser().is_file()
+        return path.is_file() and drafter_ok
+    if "hf_repo" in source and source.get("revision"):
+        return hf_snapshot_dir(source["hf_repo"], source["revision"]).is_dir()
+    return False
+
+
+def catalog_rows(catalog: dict[str, Any]) -> list[dict[str, Any]]:
+    reserve = float(catalog["defaults"]["host_reserve_gib"])
+    available = mem_available_gib()
+    state = load_active_state()
+    active = state.get("active", [])
+    rows = []
+    for name, model in catalog["models"].items():
+        budget = model.get("budget_gib")
+        fits = budget is not None and (budget + reserve) <= available
+        rows.append(
+            {
+                "name": name,
+                "backend": model["backend"],
+                "slot": model["slot"],
+                "role": model["role"],
+                "experimental": bool(model.get("experimental")),
+                "boot": bool(model.get("boot")),
+                "budget_gib": budget,
+                "fits_now": fits,
+                "installed": installed_one(name, catalog),
+                "active": name in active,
             }
-            for name, model in MODELS.items()
-        },
+        )
+    return rows
+
+
+def status_report(as_json: bool) -> dict[str, Any]:
+    catalog = load_catalog()
+    state = load_active_state()
+    active = state.get("active", [])
+    wrapper_status: dict[str, Any] | None = None
+    try:
+        completed = run_sudo_ctl(["status", "--json"], check=False)
+        if completed.returncode == 0 and completed.stdout.strip():
+            wrapper_status = json.loads(completed.stdout)
+    except (ModelctlError, json.JSONDecodeError, OSError):
+        wrapper_status = None
+    models_report = {}
+    for name in active:
+        model = get_model(catalog, name)
+        models_report[name] = {
+            "healthy": url_ok(health_url(model), timeout=2),
+            "budget_gib": model.get("budget_gib"),
+            "slot": model["slot"],
+            "role": model["role"],
+        }
+    return {
+        "mirror_active": active,
+        "wrapper_status": wrapper_status,
+        "mem_available_gib": round(mem_available_gib(), 2),
+        "models": models_report,
     }
 
 
-def installed_one(name: str) -> bool:
-    model = MODELS[name]
-    if model["runtime"] == "vllm":
-        return hf_snapshot(model).is_dir()
-    artifact = GGUF_ROOT / model["filename"]
-    if model["runtime"] == "llama_cpp":
-        binary = DATA_ROOT / "builds" / "llama.cpp" / "bin" / "llama-server"
-        return artifact.is_file() and os.access(binary, os.X_OK)
-    drafter = GGUF_ROOT / model["drafter_filename"]
-    binary = DATA_ROOT / "src" / "ds4" / "ds4-server"
-    return artifact.is_file() and drafter.is_file() and os.access(binary, os.X_OK)
-
-
-def catalog() -> list[dict[str, Any]]:
-    state = load_state()
-    results = []
-    for name, model in MODELS.items():
-        installed = installed_one(name)
-        results.append(
-            {
-                "name": name,
-                "runtime": model["runtime"],
-                "active": name in state["active"],
-                "default": name == state["default"],
-                "installed": installed,
-                "exclusive": bool(model.get("exclusive")),
-                "memory_budget_gib": model["memory_budget_gib"],
-            }
+def print_catalog_table(rows: list[dict[str, Any]]) -> None:
+    for row in rows:
+        marker = "EXPERIMENTAL" if row["experimental"] else ""
+        print(
+            f"{row['name']:<28} backend={row['backend']:<12} slot={row['slot']:<10} "
+            f"role={row['role']:<8} budget_gib={str(row['budget_gib']):<6} "
+            f"fits_now={str(row['fits_now']).lower():<5} installed={str(row['installed']).lower():<5} "
+            f"active={str(row['active']).lower():<5} {marker}"
         )
-    return results
 
+
+# ---------------------------------------------------------------------------
+# logs (stub -- modelctl has no direct docker access post-cutover)
+# ---------------------------------------------------------------------------
+
+CONTAINER_NAME_BY_BACKEND = {
+    "vllm": "spark-ai-vllm",
+    "llamacpp": "spark-ai-llamacpp",
+    "sglang": "spark-ai-sglang",
+}
+
+
+def logs_hint(name: str, catalog: dict[str, Any], follow: bool) -> None:
+    model = get_model(catalog, name)
+    backend = model["backend"]
+    container = CONTAINER_NAME_BY_BACKEND.get(backend)
+    print(
+        "modelctl has no direct docker access on this host (the operator user is not in "
+        "the docker group by design -- see docs/CONTRACTS.md §2). Run this yourself:",
+        file=sys.stderr,
+    )
+    if container:
+        flag = "-f" if follow else "--tail=200"
+        print(f"  sudo docker logs {flag} {container}", file=sys.stderr)
+    else:
+        print(f"  # backend {backend!r} runs as its own systemd unit; use journalctl", file=sys.stderr)
+    port = SLOT_PORTS.get(model["slot"])
+    if port and url_ok(f"http://127.0.0.1:{port}/metrics", timeout=1):
+        print(f"  # metrics also available at http://127.0.0.1:{port}/metrics", file=sys.stderr)
+
+
+# ---------------------------------------------------------------------------
+# eval (evals/lm-eval/run.sh, CONTRACTS.md §11)
+# ---------------------------------------------------------------------------
+
+def run_eval(name: str, model: dict[str, Any], tasks: str | None, limit: int | None) -> int:
+    # evals/lm-eval/run.sh <served_model_name> <port> [--tasks t1,t2] [--limit N]
+    if not LMEVAL_RUN.is_file():
+        print(
+            f"modelctl: {LMEVAL_RUN} not found (evals workstream not implemented yet).\n"
+            f"Expected invocation once implemented: {LMEVAL_RUN} {model.get('served_model_name', name)} "
+            f"{SLOT_PORTS.get(model.get('slot'), '<port>')} --tasks <tasks>",
+            file=sys.stderr,
+        )
+        return 1
+    port = SLOT_PORTS[model["slot"]]
+    command = ["bash", str(LMEVAL_RUN), model["served_model_name"], str(port)]
+    if tasks:
+        command += ["--tasks", tasks]
+    if limit:
+        command += ["--limit", str(limit)]
+    if TEST_MODE:
+        return 0
+    completed = subprocess.run(command)
+    return completed.returncode
+
+
+# ---------------------------------------------------------------------------
+# CLI
+# ---------------------------------------------------------------------------
 
 def output(value: Any, as_json: bool) -> None:
     if as_json:
-        print(json.dumps(value, indent=2, sort_keys=True))
+        print(json.dumps(value, indent=2, sort_keys=True, default=str))
         return
-    if isinstance(value, str):
-        print(value)
-    elif isinstance(value, list):
-        for item in value:
-            if "name" in item:
-                print(
-                    f"{item['name']:<24} runtime={item['runtime']:<10} "
-                    f"installed={str(item['installed']).lower():<5} "
-                    f"active={str(item['active']).lower():<5} default={str(item['default']).lower():<5}"
-                )
-            else:
-                print(f"{item['model']:<24} ok={str(item['ok']).lower()}")
-                for check in item["checks"]:
-                    marker = "ok" if check["ok"] else "FAIL"
-                    print(f"  {marker:<4} {check['check']:<20} {check['detail']}")
-    elif "models" in value:
-        print(f"active: {', '.join(value['active']) or '(none)'}")
-        print(f"default: {value.get('default') or '(none)'}")
-        for name, info in value["models"].items():
-            print(f"  {name:<24} healthy={str(info['healthy']).lower()}")
-    else:
-        print(json.dumps(value, indent=2, sort_keys=True))
+    print(json.dumps(value, indent=2, sort_keys=True, default=str))
 
 
-def parse_args(argv: list[str]) -> tuple[argparse.Namespace, bool]:
-    as_json = "--json" in argv
-    argv = [argument for argument in argv if argument != "--json"]
+def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
-    subparsers = parser.add_subparsers(dest="command", required=True)
-    subparsers.add_parser("catalog")
-    fetch_parser = subparsers.add_parser("fetch")
-    fetch_parser.add_argument("model", choices=MODELS)
-    verify_parser = subparsers.add_parser("verify")
-    verify_parser.add_argument("model", choices=[*MODELS, "all"])
-    activate_parser = subparsers.add_parser("activate")
-    activate_parser.add_argument("model", choices=MODELS)
-    activate_parser.add_argument("--default", action="store_true")
-    deactivate_parser = subparsers.add_parser("deactivate")
-    deactivate_parser.add_argument("model", choices=MODELS)
-    subparsers.add_parser("status")
-    logs_parser = subparsers.add_parser("logs")
-    logs_parser.add_argument("model", choices=MODELS)
-    logs_parser.add_argument("--follow", "-f", action="store_true")
-    routes_parser = subparsers.add_parser("routes")
-    routes_parser.add_argument("--no-restart", action="store_true")
-    subparsers.add_parser("ensure-boot")
-    subparsers.add_parser("init")
-    return parser.parse_args(argv), as_json
+    parser.add_argument("--json", action="store_true", help="machine-readable output where supported")
+    sub = parser.add_subparsers(dest="command", required=True)
+
+    sub.add_parser("catalog", help="list all models (incl. experimental) with fit vs current memory")
+
+    fetch = sub.add_parser("fetch", help="download a model's artifacts")
+    fetch.add_argument("model")
+
+    verify = sub.add_parser("verify", help="verify sha256/paths/revisions")
+    verify.add_argument("model", help="model id, or 'all'")
+
+    act = sub.add_parser("activate", help="activate a model (transactional, with rollback)")
+    act.add_argument("model")
+    act.add_argument("--with", dest="with_model", default=None, metavar="MODEL2")
+    act.add_argument("--experimental", action="store_true")
+    act.add_argument("--skip-sanity", action="store_true")
+
+    deact = sub.add_parser("deactivate", help="deactivate a model (or 'all')")
+    deact.add_argument("model")
+
+    sub.add_parser("status", help="active set, live health, memory, budgets")
+
+    logs = sub.add_parser("logs", help="print the command to fetch this model's container logs")
+    logs.add_argument("model")
+    logs.add_argument("-f", "--follow", action="store_true")
+
+    sanity = sub.add_parser("sanity", help="run the full sanity suite against an active model")
+    sanity.add_argument("model")
+
+    ev = sub.add_parser("eval", help="run evals/lm-eval against a model")
+    ev.add_argument("model")
+    ev.add_argument("--tasks", default=None)
+    ev.add_argument("--limit", type=int, default=None, help="passed through to lm-eval's --limit")
+
+    sub.add_parser("ensure-boot", help="activate the boot model if nothing healthy is active")
+
+    return parser
 
 
 def main(argv: list[str] | None = None) -> int:
-    args, as_json = parse_args(list(argv if argv is not None else sys.argv[1:]))
+    parser = build_parser()
+    args = parser.parse_args(list(argv if argv is not None else sys.argv[1:]))
+    as_json = args.json
     try:
         if args.command == "catalog":
-            output(catalog(), as_json)
+            catalog = load_catalog()
+            rows = catalog_rows(catalog)
+            if as_json:
+                output(rows, True)
+            else:
+                print_catalog_table(rows)
         elif args.command == "fetch":
-            fetch_one(args.model)
-            output({"model": args.model, "fetched": True, "verified": True}, as_json)
+            catalog = load_catalog()
+            output(fetch_one(args.model, catalog), as_json)
         elif args.command == "verify":
-            names = MODELS if args.model == "all" else [args.model]
-            results = [verify_one(name) for name in names]
+            catalog = load_catalog()
+            names = list(catalog["models"]) if args.model == "all" else [args.model]
+            results = [verify_one(name, catalog) for name in names]
             output(results, as_json)
             if not all(result["ok"] for result in results):
                 return 1
         elif args.command == "activate":
-            output(activate(args.model, args.default), as_json)
+            result = activate(
+                args.model,
+                with_name=args.with_model,
+                experimental=args.experimental,
+                skip_sanity=args.skip_sanity,
+            )
+            output(result, as_json)
         elif args.command == "deactivate":
             output(deactivate(args.model), as_json)
         elif args.command == "status":
-            output(status(), as_json)
+            output(status_report(as_json), as_json)
         elif args.command == "logs":
-            model = MODELS[args.model]
-            if model["runtime"] == "vllm":
-                follow_args = ["-f"] if args.follow else ["--tail=200"]
-                run(["docker", "logs", *follow_args, "spark-ai-vllm"])
-            else:
-                follow_args = ["-f"] if args.follow else ["-n", "200"]
-                run(["journalctl", "--user", "-u", model["service"], *follow_args])
-        elif args.command == "routes":
-            state = load_state()
-            install_routes(state["active"], state["default"], restart=not args.no_restart)
-            output({"routes": str(ROUTES_FILE), "active": state["active"]}, as_json)
+            catalog = load_catalog()
+            logs_hint(args.model, catalog, args.follow)
+        elif args.command == "sanity":
+            catalog = load_catalog()
+            state = load_active_state()
+            if args.model not in state.get("active", []):
+                raise ModelctlError(f"{args.model} is not active; run `modelctl activate {args.model}` first")
+            run_sanity(args.model, get_model(catalog, args.model), full=True)
+            print(f"sanity: {args.model} passed")
+        elif args.command == "eval":
+            catalog = load_catalog()
+            return run_eval(args.model, get_model(catalog, args.model), args.tasks, args.limit)
         elif args.command == "ensure-boot":
-            state = load_state()
-            if state["active"] and all(
-                url_ok(MODELS[name]["health_url"], timeout=1) for name in state["active"]
-            ):
-                install_routes(state["active"], state["default"], restart=True)
-                output(state, as_json)
-            else:
-                output(activate(CATALOG_DOC["boot_model"], True), as_json)
-        elif args.command == "init":
-            STATE_ROOT.mkdir(parents=True, exist_ok=True)
-            if not STATE_FILE.exists():
-                save_state(default_state())
-            state = load_state()
-            install_routes(state["active"], state["default"], restart=False)
-            output(state, as_json)
+            output(ensure_boot(), as_json)
         return 0
     except (ModelctlError, subprocess.CalledProcessError, OSError) as error:
         if as_json:

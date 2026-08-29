@@ -1,0 +1,35 @@
+# /etc/sudoers.d/spark-ai-stack — installed 0440 root:root by bootstrap.sh.
+#
+# Threat model (docs/CONTRACTS.md §2): AI coding agents and interactive shells
+# run as niyam-gb10, which is removed from the `docker` group at cutover. This
+# file is the ONLY way that user can reach root, and it grants NOPASSWD access
+# to exactly one binary — /usr/local/sbin/spark-ai-ctl — and only for the
+# operational verbs listed below. spark-ai-ctl itself re-validates every
+# argument with argparse `choices=` and explicit catalog checks; this file's
+# job is just to make sure no OTHER command, and no OTHER verb of this
+# command, can ever run without a password.
+#
+# `spark-ai-ctl sync` and all `spark-ai-ctl secrets-*` verbs are deliberately
+# ABSENT from this file. Those verbs can rewrite root-owned config from the
+# user-writable repo, or touch secret material, so they fall through to the
+# system's normal (password-required) sudo policy instead — see
+# docs/SECURITY.md for the human-trust-gate rationale.
+#
+# Each line matches on the verb as the literal first argument; a trailing `*`
+# is used only for verbs that additionally take a model-id/flag argument
+# (backend-start, backend-stop, status --json) — spark-ai-ctl's own argparse
+# is what actually constrains those arguments to safe values.
+
+niyam-gb10 ALL=(root) NOPASSWD: /usr/local/sbin/spark-ai-ctl core-up
+niyam-gb10 ALL=(root) NOPASSWD: /usr/local/sbin/spark-ai-ctl core-down
+niyam-gb10 ALL=(root) NOPASSWD: /usr/local/sbin/spark-ai-ctl core-restart
+niyam-gb10 ALL=(root) NOPASSWD: /usr/local/sbin/spark-ai-ctl core-ps
+niyam-gb10 ALL=(root) NOPASSWD: /usr/local/sbin/spark-ai-ctl backend-start *
+niyam-gb10 ALL=(root) NOPASSWD: /usr/local/sbin/spark-ai-ctl backend-stop *
+niyam-gb10 ALL=(root) NOPASSWD: /usr/local/sbin/spark-ai-ctl gateway-reload
+niyam-gb10 ALL=(root) NOPASSWD: /usr/local/sbin/spark-ai-ctl monitoring-up
+niyam-gb10 ALL=(root) NOPASSWD: /usr/local/sbin/spark-ai-ctl monitoring-down
+niyam-gb10 ALL=(root) NOPASSWD: /usr/local/sbin/spark-ai-ctl utilities-up
+niyam-gb10 ALL=(root) NOPASSWD: /usr/local/sbin/spark-ai-ctl utilities-down
+niyam-gb10 ALL=(root) NOPASSWD: /usr/local/sbin/spark-ai-ctl status
+niyam-gb10 ALL=(root) NOPASSWD: /usr/local/sbin/spark-ai-ctl status *

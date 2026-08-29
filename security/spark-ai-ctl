@@ -1,0 +1,1190 @@
+#!/usr/bin/python3
+"""spark-ai-ctl — privileged control wrapper for spark-ai-stack.
+
+Installed root:root 0755 at /usr/local/sbin/spark-ai-ctl and invoked either
+directly by root (systemd units) or via the NOPASSWD sudoers drop-in at
+/etc/sudoers.d/spark-ai-stack (docs/CONTRACTS.md §5, §12 workstream B).
+
+Security invariants (see docs/CONTRACTS.md §2 and docs/SECURITY.md):
+  * This program refuses to run unless the effective UID is 0.
+  * It NEVER reads user-writable files. The repository at
+    /home/niyam-gb10/code/spark-ai-stack is UNTRUSTED input and is touched
+    only by the `sync` verb, which reads it explicitly to copy it into
+    /etc/spark-ai-stack (root-owned) after a human reviews a printed diff.
+  * All other verbs consume ONLY root-owned files under /etc/spark-ai-stack,
+    /var/lib/spark-ai-stack and /run/spark-ai-stack.
+  * Every path this program writes to is a hardcoded constant. No verb
+    accepts a free-form path, shell snippet, or environment passthrough.
+  * subprocess is always invoked with an explicit argv list and shell=False.
+  * Catalog-supplied CLI arguments and environment variables are validated
+    against an explicit allow/deny policy before they are allowed to reach a
+    rendered compose override (see validate_args_tokens / validate_environment).
+
+Exit codes: 0 ok, 1 general/runtime error, 2 usage/refusal, 3 catalog content
+rejected as unsafe (backend-start / backend-stop / gateway-reload render path).
+"""
+
+from __future__ import annotations
+
+import argparse
+import contextlib
+import copy
+import datetime as dt
+import difflib
+import fcntl
+import json
+import os
+import re
+import secrets
+import subprocess
+import sys
+import tempfile
+from pathlib import Path
+from typing import Any
+
+import yaml
+
+# --------------------------------------------------------------------------
+# Hardcoded paths (docs/CONTRACTS.md §1). None of these are ever derived from
+# argv, environment variables, or file content.
+# --------------------------------------------------------------------------
+
+REPO_ROOT = Path("/home/niyam-gb10/code/spark-ai-stack")
+
+# The two allowed volume-source prefixes under the user's home directory.
+# These are hardcoded strings used only to render bind-mount-adjacent
+# container paths (via the fixed prefixes below); the wrapper never reads
+# anything else under /home, and never accepts a caller-supplied path here.
+DATA_ROOT = Path("/home/niyam-gb10/ai-data")
+HF_CACHE_HOST_DIR = DATA_ROOT / "huggingface"
+GGUF_HOST_DIR = DATA_ROOT / "models" / "gguf"
+
+ETC_ROOT = Path("/etc/spark-ai-stack")
+ETC_COMPOSE_DIR = ETC_ROOT / "compose"
+ETC_ENVD_DIR = ETC_ROOT / "env.d"
+ETC_MODELS_FILE = ETC_ROOT / "models.yaml"
+ETC_EXPERIMENTAL_FILE = ETC_ROOT / "experimental.yaml"
+ETC_COMPOSE_FILE = ETC_COMPOSE_DIR / "compose.yml"
+ETC_MONITORING_FILE = ETC_COMPOSE_DIR / "monitoring.yml"
+ETC_LITELLM_TEMPLATE = ETC_COMPOSE_DIR / "litellm.template.yaml"
+ETC_SEARXNG_SETTINGS = ETC_COMPOSE_DIR / "searxng-settings.yml"
+SECRETS_FILE = ETC_ROOT / "secrets.env"
+
+RUN_ROOT = Path("/run/spark-ai-stack")
+LOCK_FILE = RUN_ROOT / "lock"
+OVERRIDE_FILE = RUN_ROOT / "override.yaml"
+LITELLM_RUNTIME_CONFIG = RUN_ROOT / "litellm-config.yaml"
+
+VAR_LIB_ROOT = Path("/var/lib/spark-ai-stack")
+ACTIVE_JSON_FILE = VAR_LIB_ROOT / "active.json"
+
+# repo-relative source -> /etc/spark-ai-stack-relative destination, consumed
+# only by `sync`. Order is preserved for deterministic diff output.
+SYNC_MAP: list[tuple[Path, Path]] = [
+    (REPO_ROOT / "compose" / "compose.yml", ETC_COMPOSE_FILE),
+    (REPO_ROOT / "compose" / "monitoring.yml", ETC_MONITORING_FILE),
+    (REPO_ROOT / "config" / "models.yaml", ETC_MODELS_FILE),
+    (REPO_ROOT / "config" / "experimental.yaml", ETC_EXPERIMENTAL_FILE),
+    (REPO_ROOT / "config" / "litellm.template.yaml", ETC_LITELLM_TEMPLATE),
+    (REPO_ROOT / "config" / "searxng-settings.yml", ETC_SEARXNG_SETTINGS),
+    # Monitoring-profile configs, mounted by compose/monitoring.yml from the
+    # root-owned copies (prometheus config + grafana provisioning/dashboards).
+    (REPO_ROOT / "monitoring" / "prometheus.yml", ETC_COMPOSE_DIR / "prometheus.yml"),
+    (
+        REPO_ROOT / "monitoring" / "grafana" / "provisioning" / "datasources" / "prometheus.yml",
+        ETC_COMPOSE_DIR / "grafana" / "provisioning" / "datasources" / "prometheus.yml",
+    ),
+    (
+        REPO_ROOT / "monitoring" / "grafana" / "provisioning" / "dashboards" / "default.yml",
+        ETC_COMPOSE_DIR / "grafana" / "provisioning" / "dashboards" / "default.yml",
+    ),
+    (
+        REPO_ROOT / "monitoring" / "grafana" / "dashboards" / "gb10-stack.json",
+        ETC_COMPOSE_DIR / "grafana" / "dashboards" / "gb10-stack.json",
+    ),
+]
+
+COMPOSE_PROJECT = "spark-ai"
+
+SECRET_KEYS = [
+    "LITELLM_MASTER_KEY",
+    "POSTGRES_PASSWORD",
+    "WEBUI_SECRET_KEY",
+    "SEARXNG_SECRET",
+    "GRAFANA_ADMIN_PASSWORD",
+    "HF_TOKEN",
+]
+
+SLOT_HOST_PORT = {"primary": 8001, "secondary": 8002}
+
+SUPPORTED_BACKENDS = ("vllm", "llamacpp", "sglang")
+BACKEND_CONTAINER_PORT = {"vllm": 8000, "llamacpp": 8080, "sglang": 30000}
+BACKEND_SERVICE_NAME = {"vllm": "vllm", "llamacpp": "llamacpp", "sglang": "sglang"}
+
+
+def service_for(backend: str, slot: str) -> str:
+    """Compose service name for a (backend, slot) pair.
+
+    Each slot needs its own container so that e.g. a text model (vllm,
+    primary) and a vision model (vllm, secondary) can run concurrently.
+    The secondary variants are separate skeleton services in compose.yml;
+    sglang deliberately has no secondary variant.
+    """
+    if slot == "secondary":
+        if backend == "sglang":
+            raise CatalogError("sglang models support only the primary slot")
+        return f"{backend}-secondary"
+    return BACKEND_SERVICE_NAME[backend]
+
+# These hardcoded lists are the FULL intended service sets per
+# docs/CONTRACTS.md §3/§4. Some (e.g. `whisper`) are still commented-out
+# stubs in compose/compose.yml pending an image pin, so every *-up/down/
+# restart handler below resolves this list against `docker compose config
+# --services` first and silently drops names the current compose files don't
+# define yet — never the other way around (no name is ever added that isn't
+# already in this hardcoded list).
+CORE_SERVICES = ["litellm", "openwebui", "postgres", "searxng"]
+MONITORING_SERVICES = ["prometheus", "node-exporter", "grafana"]
+UTILITY_SERVICES = ["embeddings", "whisper"]
+
+# Container-side mount targets. These are hardcoded; the host source of each
+# mount is one of the two DATA_ROOT prefixes above and is authored only in
+# the root-owned compose skeleton (compose/compose.yml), never by this
+# script. Listed here purely for the docstrings / drafter path derivation.
+GGUF_CONTAINER_DIR = "/models/gguf"
+VLLM_LOCAL_MODEL_PREFIX = "/data/hf-local"
+
+FORBIDDEN_ARG_PREFIXES = ("-v", "--volume", "--mount")
+ENV_ALLOWLIST_EXACT = {"HF_HUB_OFFLINE"}
+ENV_ALLOWLIST_PREFIXES = ("VLLM_", "SGLANG_")
+
+HF_REPO_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.\-]*/[A-Za-z0-9][A-Za-z0-9_.\-]*$")
+SAFE_BASENAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.\-]*$")
+SERVED_NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._\-]*$")
+
+SECRETS_HEADER = (
+    "# spark-ai-stack secrets - managed by spark-ai-ctl secrets-init / secrets-rotate.\n"
+    "# Do not hand-edit values other than HF_TOKEN; use\n"
+    "# `sudo spark-ai-ctl secrets-rotate <KEY>` instead.\n"
+)
+
+
+class SparkCtlError(Exception):
+    """Base error for all user-facing failures. Caught in main(); never a traceback."""
+
+    exit_code = 1
+
+
+class CatalogError(SparkCtlError):
+    """Raised when catalog content (models.yaml/experimental.yaml) is rejected as unsafe."""
+
+    exit_code = 3
+
+
+# --------------------------------------------------------------------------
+# Low-level I/O helpers
+# --------------------------------------------------------------------------
+
+
+def now_iso() -> str:
+    return dt.datetime.now(dt.timezone.utc).isoformat()
+
+
+def ensure_dir(path: Path, mode: int) -> None:
+    """Create `path` (and parents) if missing and force root:root ownership + mode.
+
+    Idempotent and safe to call unconditionally: makes the wrapper self-healing
+    even if bootstrap.sh has not (yet) created every directory.
+    """
+    path.mkdir(parents=True, exist_ok=True)
+    os.chmod(path, mode)
+    os.chown(path, 0, 0)
+
+
+def atomic_write(path: Path, content: str, mode: int) -> None:
+    """Write `content` to `path` atomically: tmp file + fsync + rename, root:root owned."""
+    ensure_dir(path.parent, 0o755)
+    fd, tmp_name = tempfile.mkstemp(prefix=f".{path.name}.", dir=str(path.parent))
+    tmp_path = Path(tmp_name)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            handle.write(content)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.chmod(tmp_path, mode)
+        os.chown(tmp_path, 0, 0)
+        os.replace(tmp_path, path)
+    except BaseException:
+        with contextlib.suppress(FileNotFoundError):
+            os.unlink(tmp_path)
+        raise
+
+
+@contextlib.contextmanager
+def state_lock():
+    """Exclusive flock on /run/spark-ai-stack/lock, held for the duration of any
+    state-mutating verb (docs/CONTRACTS.md §5: "All state-mutating verbs take
+    an flock")."""
+    ensure_dir(RUN_ROOT, 0o755)
+    with open(LOCK_FILE, "a+", encoding="utf-8") as handle:
+        fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+        try:
+            yield
+        finally:
+            fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+
+
+def run(argv: list[str], *, check: bool = True, capture: bool = False) -> subprocess.CompletedProcess:
+    """subprocess wrapper: explicit argv list, shell=False, always."""
+    return subprocess.run(argv, shell=False, check=check, text=True, capture_output=capture)
+
+
+def compose_base_files() -> list[str]:
+    files = [str(ETC_COMPOSE_FILE)]
+    if ETC_MONITORING_FILE.exists():
+        files.append(str(ETC_MONITORING_FILE))
+    if OVERRIDE_FILE.exists():
+        files.append(str(OVERRIDE_FILE))
+    return files
+
+
+def compose_argv(*verb_and_args: str, profile: str | None = None) -> list[str]:
+    """Build a `docker compose` invocation per docs/CONTRACTS.md §4's fixed shape."""
+    argv = ["docker", "compose", "--project-name", COMPOSE_PROJECT]
+    for f in compose_base_files():
+        argv += ["-f", f]
+    if profile:
+        argv += ["--profile", profile]
+    argv += list(verb_and_args)
+    return argv
+
+
+def resolve_defined_services(hardcoded_names: list[str], *, profile: str | None = None) -> list[str]:
+    """Intersect a hardcoded service-name list with what the current compose
+    files actually define, preserving order. A name in `hardcoded_names` that
+    isn't defined yet (e.g. `whisper`, pending an image pin) is skipped with a
+    warning rather than making the whole verb fail with "no such service".
+    """
+    result = subprocess.run(
+        compose_argv("config", "--services", profile=profile),
+        text=True, capture_output=True, check=False,
+    )
+    if result.returncode != 0:
+        # Can't discover services (e.g. compose files not synced yet); fall
+        # back to the full hardcoded list and let docker compose report the
+        # real error.
+        return list(hardcoded_names)
+    defined = {line.strip() for line in result.stdout.splitlines() if line.strip()}
+    resolved = [name for name in hardcoded_names if name in defined]
+    for missing in hardcoded_names:
+        if missing not in defined:
+            print(
+                f"spark-ai-ctl: note: service '{missing}' is not defined in the "
+                "current compose files yet; skipping it",
+                file=sys.stderr,
+            )
+    return resolved
+
+
+def parse_env_file(path: Path) -> dict[str, str]:
+    """Minimal KEY=VALUE parser for the files this program itself writes.
+
+    Not a general-purpose shell/env parser: comment lines start with '#',
+    blank lines are ignored, and values are taken verbatim after the first
+    '='. This is sufficient because secrets.env is authored exclusively by
+    this program (render_secrets_file / secrets-rotate).
+    """
+    values: dict[str, str] = {}
+    if not path.exists():
+        return values
+    for line in path.read_text(encoding="utf-8").splitlines():
+        stripped = line.strip()
+        if not stripped or stripped.startswith("#") or "=" not in stripped:
+            continue
+        key, _, value = stripped.partition("=")
+        values[key.strip()] = value.strip()
+    return values
+
+
+# --------------------------------------------------------------------------
+# Catalog loading & validation
+# --------------------------------------------------------------------------
+
+
+def load_catalog(path: Path) -> dict[str, Any]:
+    """Load and minimally validate a root-owned catalog file (yaml.safe_load only)."""
+    if not path.exists():
+        raise SparkCtlError(f"catalog file missing: {path} (run 'sudo spark-ai-ctl sync' first)")
+    try:
+        with path.open("r", encoding="utf-8") as handle:
+            doc = yaml.safe_load(handle)
+    except yaml.YAMLError as exc:
+        raise SparkCtlError(f"failed to parse {path}: {exc}") from exc
+    if not isinstance(doc, dict) or "models" not in doc or not isinstance(doc["models"], dict):
+        raise SparkCtlError(f"{path} is not a valid catalog document (missing top-level 'models' mapping)")
+    return doc
+
+
+def discover_catalog_ids() -> tuple[list[str], list[str]]:
+    """Best-effort model-id discovery used only to populate argparse `choices=`.
+
+    Never raises: an unreadable/missing catalog just means argparse falls back
+    to unrestricted string arguments for that catalog, and the real
+    validation still happens in resolve_for_backend_start()/find_catalog_entry().
+    """
+
+    def ids_from(path: Path) -> list[str]:
+        try:
+            doc = load_catalog(path)
+        except SparkCtlError:
+            return []
+        return sorted(doc["models"].keys())
+
+    return ids_from(ETC_MODELS_FILE), ids_from(ETC_EXPERIMENTAL_FILE)
+
+
+def find_catalog_entry(model_id: str) -> tuple[dict[str, Any] | None, bool]:
+    """Look up `model_id` in models.yaml, then experimental.yaml if present.
+
+    Returns (config, is_experimental) or (None, False) if not found in either.
+    Raises SparkCtlError if a catalog file that exists cannot be parsed.
+    """
+    main_doc = load_catalog(ETC_MODELS_FILE)
+    main_models = main_doc["models"]
+    if model_id in main_models:
+        return main_models[model_id], False
+    if ETC_EXPERIMENTAL_FILE.exists():
+        exp_doc = load_catalog(ETC_EXPERIMENTAL_FILE)
+        exp_models = exp_doc["models"]
+        if model_id in exp_models:
+            return exp_models[model_id], True
+    return None, False
+
+
+def validate_served_name(name: Any, model_id: str) -> str:
+    if not isinstance(name, str) or not SERVED_NAME_RE.match(name):
+        raise CatalogError(
+            f"model '{model_id}': served_model_name {name!r} is missing or unsafe "
+            f"(must match {SERVED_NAME_RE.pattern})"
+        )
+    return name
+
+
+def validate_args_tokens(raw_args: Any, model_id: str) -> list[str]:
+    """Validate catalog `args:` — the only place free-form backend CLI flags
+    originate. Rejects (CatalogError, exit 3) anything that could smuggle a
+    volume/mount flag or a non-scalar (structured) element.
+    """
+    if raw_args is None:
+        return []
+    if not isinstance(raw_args, list):
+        raise CatalogError(f"model '{model_id}': catalog 'args' must be a list")
+    tokens: list[str] = []
+    for item in raw_args:
+        if isinstance(item, (dict, list)):
+            raise CatalogError(
+                f"model '{model_id}': catalog 'args' entries must be scalars; "
+                f"found a nested structure ({item!r})"
+            )
+        token = str(item)
+        if "\n" in token or "\x00" in token:
+            raise CatalogError(f"model '{model_id}': catalog arg contains a forbidden control character")
+        for forbidden in FORBIDDEN_ARG_PREFIXES:
+            if token.startswith(forbidden):
+                raise CatalogError(
+                    f"model '{model_id}': catalog arg '{token}' is forbidden "
+                    f"(matches disallowed prefix '{forbidden}')"
+                )
+        tokens.append(token)
+    return tokens
+
+
+def validate_environment(raw_env: Any, model_id: str) -> dict[str, str]:
+    """Validate catalog `environment:` against the fixed allowlist
+    {HF_HUB_OFFLINE, VLLM_*, SGLANG_*} (docs/CONTRACTS.md §5)."""
+    if not raw_env:
+        return {}
+    if not isinstance(raw_env, dict):
+        raise CatalogError(f"model '{model_id}': catalog 'environment' must be a mapping")
+    result: dict[str, str] = {}
+    for raw_key, value in raw_env.items():
+        key = str(raw_key)
+        allowed = key in ENV_ALLOWLIST_EXACT or any(key.startswith(p) for p in ENV_ALLOWLIST_PREFIXES)
+        if not allowed:
+            raise CatalogError(
+                f"model '{model_id}': environment key '{key}' is not in the allowlist "
+                f"(HF_HUB_OFFLINE, VLLM_*, SGLANG_*)"
+            )
+        if isinstance(value, (dict, list)):
+            raise CatalogError(f"model '{model_id}': environment value for '{key}' must be a scalar")
+        result[key] = str(value)
+    return result
+
+
+def build_vllm_argv(cfg: dict[str, Any], served_name: str) -> list[str]:
+    source = cfg.get("source") or {}
+    hf_repo = source.get("hf_repo")
+    local_path = source.get("local_path")
+    port = str(BACKEND_CONTAINER_PORT["vllm"])
+    if hf_repo:
+        if not isinstance(hf_repo, str) or not HF_REPO_RE.match(hf_repo):
+            raise CatalogError(f"source.hf_repo {hf_repo!r} is not a safe 'org/repo' identifier")
+        model_arg = hf_repo
+    elif local_path:
+        name = Path(str(local_path)).name
+        if not name or not SAFE_BASENAME_RE.match(name):
+            raise CatalogError(f"source.local_path {local_path!r} does not resolve to a safe filename")
+        model_arg = f"{VLLM_LOCAL_MODEL_PREFIX}/{name}"
+    else:
+        raise CatalogError("vllm model catalog entry needs source.hf_repo or source.local_path")
+    return [
+        "vllm", "serve", model_arg,
+        "--host", "0.0.0.0",
+        "--port", port,
+        "--served-model-name", served_name,
+    ]
+
+
+def build_sglang_argv(cfg: dict[str, Any], served_name: str) -> list[str]:
+    source = cfg.get("source") or {}
+    hf_repo = source.get("hf_repo")
+    if not isinstance(hf_repo, str) or not HF_REPO_RE.match(hf_repo):
+        raise CatalogError(f"sglang model catalog entry needs a safe source.hf_repo (got {hf_repo!r})")
+    port = str(BACKEND_CONTAINER_PORT["sglang"])
+    return [
+        "python3", "-m", "sglang.launch_server",
+        "--model-path", hf_repo,
+        "--host", "0.0.0.0",
+        "--port", port,
+        "--served-model-name", served_name,
+    ]
+
+
+def build_llamacpp_argv(
+    cfg: dict[str, Any], served_name: str, args_tokens: list[str]
+) -> tuple[list[str], list[str]]:
+    """Returns (fixed_prefix_argv, remaining_catalog_args). The `--model-draft`
+    marker token, if present in args_tokens, is consumed here and replaced
+    with the catalog's resolved drafter path.
+    """
+    source = cfg.get("source") or {}
+    filename = source.get("filename")
+    if not filename or not SAFE_BASENAME_RE.match(str(filename)):
+        raise CatalogError(f"llamacpp model catalog entry needs a safe source.filename (got {filename!r})")
+    port = str(BACKEND_CONTAINER_PORT["llamacpp"])
+    argv = [
+        "/usr/local/bin/llama-server",
+        "--model", f"{GGUF_CONTAINER_DIR}/{filename}",
+        "--host", "0.0.0.0",
+        "--port", port,
+        "--alias", served_name,
+    ]
+    remaining = list(args_tokens)
+    if "--model-draft" in remaining:
+        drafter = source.get("drafter") or {}
+        draft_filename = drafter.get("filename")
+        if not draft_filename or not SAFE_BASENAME_RE.match(str(draft_filename)):
+            raise CatalogError(
+                "args request --model-draft but catalog defines no usable source.drafter.filename"
+            )
+        argv += ["--model-draft", f"{GGUF_CONTAINER_DIR}/{draft_filename}"]
+        remaining = [t for t in remaining if t != "--model-draft"]
+    return argv, remaining
+
+
+def build_backend_argv(
+    cfg: dict[str, Any], backend: str, served_name: str
+) -> list[str]:
+    """Full command argv for `backend`: hardcoded prefix + validated catalog args."""
+    args_tokens = validate_args_tokens(cfg.get("args"), served_name)
+    if backend == "vllm":
+        return build_vllm_argv(cfg, served_name) + args_tokens
+    if backend == "sglang":
+        return build_sglang_argv(cfg, served_name) + args_tokens
+    if backend == "llamacpp":
+        prefix, remaining = build_llamacpp_argv(cfg, served_name, args_tokens)
+        return prefix + remaining
+    raise CatalogError(f"unsupported backend '{backend}'")
+
+
+def resolve_for_backend_start(model_id: str, experimental_flag: bool):
+    """Resolve + gate a model-id for `backend-start` specifically.
+
+    Unlike find_catalog_entry() (used for re-rendering already-active models),
+    this enforces the --experimental gate and the supported-backend list.
+    """
+    cfg, is_experimental = find_catalog_entry(model_id)
+    if cfg is None:
+        hint = " or experimental.yaml" if ETC_EXPERIMENTAL_FILE.exists() else ""
+        raise SparkCtlError(f"unknown model '{model_id}' (not found in models.yaml{hint})")
+    if is_experimental and not experimental_flag:
+        raise SparkCtlError(f"model '{model_id}' is experimental-tier; retry with --experimental")
+    backend = cfg.get("backend")
+    slot = cfg.get("slot")
+    served_name = validate_served_name(cfg.get("served_model_name"), model_id)
+    if slot not in SLOT_HOST_PORT:
+        raise SparkCtlError(f"model '{model_id}' declares invalid slot {slot!r} (must be 'primary' or 'secondary')")
+    if backend not in SUPPORTED_BACKENDS:
+        raise SparkCtlError(
+            f"backend {backend!r} for model '{model_id}' is not managed by "
+            "'spark-ai-ctl backend-start'; it runs under its own systemd unit "
+            "outside the docker compose stack (see docs/CONTRACTS.md §7)"
+        )
+    return cfg, backend, slot, served_name
+
+
+# --------------------------------------------------------------------------
+# active.json (authoritative active-model state; written only by this program)
+# --------------------------------------------------------------------------
+
+
+def load_active() -> dict[str, Any]:
+    if not ACTIVE_JSON_FILE.exists():
+        return {"active": {}, "updated": now_iso()}
+    try:
+        data = json.loads(ACTIVE_JSON_FILE.read_text(encoding="utf-8"))
+    except (json.JSONDecodeError, OSError) as exc:
+        raise SparkCtlError(f"{ACTIVE_JSON_FILE} is corrupt: {exc}") from exc
+    if not isinstance(data, dict):
+        raise SparkCtlError(f"{ACTIVE_JSON_FILE} is corrupt: expected a JSON object")
+    data.setdefault("active", {})
+    data.setdefault("updated", now_iso())
+    return data
+
+
+def save_active(data: dict[str, Any]) -> None:
+    ensure_dir(VAR_LIB_ROOT, 0o755)
+    data["updated"] = now_iso()
+    atomic_write(ACTIVE_JSON_FILE, json.dumps(data, indent=2, sort_keys=True) + "\n", 0o644)
+
+
+# --------------------------------------------------------------------------
+# Rendering: /run/spark-ai-stack/override.yaml and litellm-config.yaml
+# --------------------------------------------------------------------------
+
+
+def render_override(active: dict[str, Any]) -> None:
+    """Rebuild the compose override from active.json alone (idempotent, and the
+    only author of this file). Only ever sets services.<backend>.command,
+    services.<backend>.ports, and an allowlisted services.<backend>.environment
+    — the full extent permitted by docs/CONTRACTS.md §2.4.
+    """
+    services: dict[str, Any] = {}
+    for model_id, rec in active["active"].items():
+        backend = rec.get("backend")
+        if backend not in SUPPORTED_BACKENDS:
+            # Experimental native backends (ds4, llamacpp-fork) are never
+            # represented in the compose override; they run under their own
+            # systemd units and are simply skipped here.
+            continue
+        cfg, _ = find_catalog_entry(model_id)
+        if cfg is None:
+            print(
+                f"spark-ai-ctl: warning: active model '{model_id}' no longer resolves "
+                "in the root catalog; leaving its override entry out (it may already "
+                "be running from a previous render)",
+                file=sys.stderr,
+            )
+            continue
+        served_name = rec.get("served_model_name") or validate_served_name(
+            cfg.get("served_model_name"), model_id
+        )
+        args_tokens = validate_args_tokens(cfg.get("args"), model_id)
+        env_vars = validate_environment(cfg.get("environment"), model_id)
+        service = rec.get("service") or service_for(backend, rec.get("slot", "primary"))
+        if backend == "llamacpp":
+            prefix, remaining = build_llamacpp_argv(cfg, served_name, args_tokens)
+            command = prefix + remaining
+        elif backend == "vllm":
+            command = build_vllm_argv(cfg, served_name) + args_tokens
+        else:
+            command = build_sglang_argv(cfg, served_name) + args_tokens
+        entry: dict[str, Any] = {
+            "command": command,
+            "ports": [f"127.0.0.1:{rec['port']}:{BACKEND_CONTAINER_PORT[backend]}"],
+        }
+        if env_vars:
+            entry["environment"] = env_vars
+        services[service] = entry
+
+    header = (
+        "# Rendered by spark-ai-ctl. Do not edit by hand; regenerated on every\n"
+        "# backend-start / backend-stop from /var/lib/spark-ai-stack/active.json.\n"
+    )
+    body = yaml.safe_dump({"services": services}, sort_keys=False, default_flow_style=False)
+    atomic_write(OVERRIDE_FILE, header + body, 0o644)
+
+
+def render_litellm_config(active: dict[str, Any]) -> None:
+    """Rebuild /run/spark-ai-stack/litellm-config.yaml from the root-owned
+    template plus active.json. The master key is always referenced via
+    os.environ/LITELLM_MASTER_KEY, never inlined as a literal.
+    """
+    if not ETC_LITELLM_TEMPLATE.exists():
+        raise SparkCtlError(
+            f"litellm template missing: {ETC_LITELLM_TEMPLATE} (run 'sudo spark-ai-ctl sync' first)"
+        )
+    try:
+        with ETC_LITELLM_TEMPLATE.open("r", encoding="utf-8") as handle:
+            template = yaml.safe_load(handle) or {}
+    except yaml.YAMLError as exc:
+        raise SparkCtlError(f"failed to parse litellm template: {exc}") from exc
+    if not isinstance(template, dict):
+        raise SparkCtlError(f"{ETC_LITELLM_TEMPLATE} must be a YAML mapping")
+
+    doc = copy.deepcopy(template)
+    model_list: list[dict[str, Any]] = []
+    primary_params: dict[str, Any] | None = None
+    for model_id, rec in sorted(active["active"].items()):
+        params = {
+            "model": f"openai/{rec['served_model_name']}",
+            "api_base": f"http://host.docker.internal:{rec['port']}/v1",
+            "api_key": "none",
+        }
+        model_list.append({"model_name": model_id, "litellm_params": params})
+        if rec.get("slot") == "primary":
+            primary_params = params
+    if primary_params is not None:
+        model_list.append({"model_name": "local/default", "litellm_params": dict(primary_params)})
+
+    doc["model_list"] = model_list
+    doc.setdefault("general_settings", {})
+    if not isinstance(doc["general_settings"], dict):
+        doc["general_settings"] = {}
+    doc["general_settings"]["master_key"] = "os.environ/LITELLM_MASTER_KEY"
+
+    header = (
+        "# Rendered by spark-ai-ctl. Do not edit by hand; regenerated on every\n"
+        "# gateway-reload / backend-start / backend-stop.\n"
+    )
+    body = yaml.safe_dump(doc, sort_keys=False, default_flow_style=False)
+    atomic_write(LITELLM_RUNTIME_CONFIG, header + body, 0o644)
+
+
+# --------------------------------------------------------------------------
+# Secrets (docs/CONTRACTS.md §6)
+# --------------------------------------------------------------------------
+
+
+def render_secrets_file(values: dict[str, str]) -> str:
+    lines = [SECRETS_HEADER.rstrip("\n")]
+    for key in SECRET_KEYS:
+        if key == "HF_TOKEN":
+            lines.append(
+                "# HF_TOKEN: your Hugging Face access token "
+                "(https://huggingface.co/settings/tokens)."
+            )
+            lines.append(
+                "# Left empty by secrets-init; set it by hand, then re-run "
+                "secrets-init or sync to re-derive env.d."
+            )
+        lines.append(f"{key}={values.get(key, '')}")
+    return "\n".join(lines) + "\n"
+
+
+def derive_env_d(values: dict[str, str]) -> None:
+    """Derive /etc/spark-ai-stack/env.d/<service>.env per the docs/CONTRACTS.md
+    §6 exposure table. Idempotent; called from secrets-init, secrets-rotate,
+    and sync.
+    """
+    ensure_dir(ETC_ENVD_DIR, 0o755)
+    litellm_master = values.get("LITELLM_MASTER_KEY", "")
+    postgres_password = values.get("POSTGRES_PASSWORD", "")
+    webui_secret = values.get("WEBUI_SECRET_KEY", "")
+    searxng_secret = values.get("SEARXNG_SECRET", "")
+    hf_token = values.get("HF_TOKEN", "")
+
+    atomic_write(
+        ETC_ENVD_DIR / "litellm.env",
+        f"LITELLM_MASTER_KEY={litellm_master}\n"
+        f"DATABASE_URL=postgresql://litellm:{postgres_password}@postgres:5432/litellm\n",
+        0o600,
+    )
+    atomic_write(
+        ETC_ENVD_DIR / "openwebui.env",
+        f"WEBUI_SECRET_KEY={webui_secret}\n"
+        f"OPENAI_API_KEY={litellm_master}\n"
+        "OPENAI_API_BASE_URL=http://litellm:4000/v1\n",
+        0o600,
+    )
+    atomic_write(ETC_ENVD_DIR / "searxng.env", f"SEARXNG_SECRET={searxng_secret}\n", 0o600)
+    atomic_write(
+        ETC_ENVD_DIR / "grafana.env",
+        f"GF_SECURITY_ADMIN_PASSWORD={values.get('GRAFANA_ADMIN_PASSWORD', '')}\n",
+        0o600,
+    )
+
+    backend_env = f"HF_TOKEN={hf_token}\nHF_HOME=/data/hf\n"
+    for name in ("vllm", "llamacpp", "sglang"):
+        atomic_write(ETC_ENVD_DIR / f"{name}.env", backend_env, 0o600)
+
+    # Raw single-line value for compose `secrets:` file-source consumption
+    # (POSTGRES_PASSWORD_FILE), never an env_file.
+    atomic_write(ETC_ENVD_DIR / "postgres_password", f"{postgres_password}\n", 0o600)
+
+
+def cmd_secrets_init(args: argparse.Namespace) -> int:
+    """Create secrets.env if missing, or complete any missing keys in place.
+    Never overwrites an existing non-empty value. Always re-derives env.d."""
+    with state_lock():
+        ensure_dir(ETC_ROOT, 0o755)
+        existing = parse_env_file(SECRETS_FILE)
+        values: dict[str, str] = {}
+        report: list[tuple[str, str]] = []
+        for key in SECRET_KEYS:
+            current = existing.get(key, "").strip()
+            if current:
+                values[key] = current
+                report.append((key, "kept"))
+            elif key == "HF_TOKEN":
+                values[key] = ""
+                report.append((key, "left empty"))
+            else:
+                values[key] = secrets.token_hex(32)
+                report.append((key, "generated"))
+        atomic_write(SECRETS_FILE, render_secrets_file(values), 0o600)
+        derive_env_d(values)
+    print(f"secrets-init: {SECRETS_FILE} ready")
+    for key, action in report:
+        print(f"  {key:<20} {action}")
+    return 0
+
+
+def cmd_secrets_status(args: argparse.Namespace) -> int:
+    """Print key names + set/unset + length only. NEVER prints values."""
+    if not SECRETS_FILE.exists():
+        print(
+            f"secrets-status: {SECRETS_FILE} does not exist; run 'sudo spark-ai-ctl secrets-init'",
+            file=sys.stderr,
+        )
+    values = parse_env_file(SECRETS_FILE)
+    print(f"{'KEY':<20}{'SET':<6}{'LENGTH':<8}")
+    for key in SECRET_KEYS:
+        value = values.get(key, "")
+        is_set = bool(value.strip())
+        print(f"{key:<20}{'yes' if is_set else 'no':<6}{len(value) if is_set else 0:<8}")
+    return 0
+
+
+def cmd_secrets_rotate(args: argparse.Namespace) -> int:
+    """Regenerate a single secret key and re-derive env.d. HF_TOKEN is refused:
+    it is an externally issued credential, not something safe to replace with
+    random bytes."""
+    key = args.key
+    if key == "HF_TOKEN":
+        print(
+            "spark-ai-ctl: refusing to rotate HF_TOKEN: it is an externally issued "
+            f"Hugging Face access token, not a generated secret. Edit {SECRETS_FILE} "
+            "by hand, then run 'sudo spark-ai-ctl secrets-init' or 'sync' to re-derive env.d.",
+            file=sys.stderr,
+        )
+        return 2
+    with state_lock():
+        if not SECRETS_FILE.exists():
+            raise SparkCtlError(f"{SECRETS_FILE} does not exist; run 'secrets-init' first")
+        values = parse_env_file(SECRETS_FILE)
+        for existing_key in SECRET_KEYS:
+            values.setdefault(existing_key, "")
+        values[key] = secrets.token_hex(32)
+        atomic_write(SECRETS_FILE, render_secrets_file(values), 0o600)
+        derive_env_d(values)
+    print(f"secrets-rotate: {key} regenerated; env.d/*.env re-derived")
+    return 0
+
+
+# --------------------------------------------------------------------------
+# Compose lifecycle verbs
+# --------------------------------------------------------------------------
+
+
+def cmd_core_up(args: argparse.Namespace) -> int:
+    """Bring up the always-on core services (litellm, openwebui, postgres, searxng)."""
+    with state_lock():
+        services = resolve_defined_services(CORE_SERVICES)
+        if services:
+            run(compose_argv("up", "-d", *services))
+    print("core-up: done")
+    return 0
+
+
+def cmd_core_down(args: argparse.Namespace) -> int:
+    """Stop the core services (containers/volumes are preserved)."""
+    with state_lock():
+        services = resolve_defined_services(CORE_SERVICES)
+        if services:
+            run(compose_argv("stop", *services), check=False)
+    print("core-down: done")
+    return 0
+
+
+def cmd_core_restart(args: argparse.Namespace) -> int:
+    with state_lock():
+        services = resolve_defined_services(CORE_SERVICES)
+        if services:
+            run(compose_argv("restart", *services))
+    print("core-restart: done")
+    return 0
+
+
+def cmd_core_ps(args: argparse.Namespace) -> int:
+    """Passthrough `docker compose ps` for the whole project (read-only)."""
+    run(compose_argv("ps"), check=False)
+    return 0
+
+
+def cmd_monitoring_up(args: argparse.Namespace) -> int:
+    with state_lock():
+        services = resolve_defined_services(MONITORING_SERVICES)
+        if services:
+            run(compose_argv("up", "-d", *services))
+        else:
+            print("monitoring-up: nothing to do (no monitoring services defined yet)", file=sys.stderr)
+    print("monitoring-up: done")
+    return 0
+
+
+def cmd_monitoring_down(args: argparse.Namespace) -> int:
+    with state_lock():
+        services = resolve_defined_services(MONITORING_SERVICES)
+        if services:
+            run(compose_argv("stop", *services), check=False)
+    print("monitoring-down: done")
+    return 0
+
+
+def cmd_utilities_up(args: argparse.Namespace) -> int:
+    with state_lock():
+        services = resolve_defined_services(UTILITY_SERVICES, profile="utilities")
+        if services:
+            run(compose_argv("up", "-d", *services, profile="utilities"))
+        else:
+            print("utilities-up: nothing to do (no utility services defined yet)", file=sys.stderr)
+    print("utilities-up: done")
+    return 0
+
+
+def cmd_utilities_down(args: argparse.Namespace) -> int:
+    with state_lock():
+        services = resolve_defined_services(UTILITY_SERVICES, profile="utilities")
+        if services:
+            run(compose_argv("stop", *services, profile="utilities"), check=False)
+    print("utilities-down: done")
+    return 0
+
+
+def cmd_gateway_reload(args: argparse.Namespace) -> int:
+    """Re-render litellm-config.yaml from active.json + template, then bring
+    litellm up and restart it so it picks up the new config."""
+    with state_lock():
+        active = load_active()
+        render_litellm_config(active)
+        run(compose_argv("up", "-d", "litellm"))
+        run(compose_argv("restart", "litellm"))
+    print("gateway-reload: litellm-config.yaml rendered; litellm restarted")
+    return 0
+
+
+def stop_backend_service(service: str) -> None:
+    run(compose_argv("stop", service, profile="models"), check=False)
+
+
+def cmd_backend_start(args: argparse.Namespace) -> int:
+    """Start (or switch) the model in `args.model_id`'s slot.
+
+    Sequence (docs/CONTRACTS.md §5): validate -> render override.yaml ->
+    `compose up -d <service>` -> update active.json -> re-render
+    litellm-config.yaml (file only; does NOT restart litellm — that is the
+    separate `gateway-reload` verb, invoked explicitly by the caller).
+    """
+    with state_lock():
+        cfg, backend, slot, served_name = resolve_for_backend_start(args.model_id, args.experimental)
+        # Validate now so an unsafe catalog entry is rejected before any state
+        # mutation happens.
+        args_tokens = validate_args_tokens(cfg.get("args"), args.model_id)
+        validate_environment(cfg.get("environment"), args.model_id)
+        if backend == "llamacpp":
+            build_llamacpp_argv(cfg, served_name, args_tokens)  # validate only
+        elif backend == "vllm":
+            build_vllm_argv(cfg, served_name)
+        else:
+            build_sglang_argv(cfg, served_name)
+
+        active = load_active()
+        host_port = SLOT_HOST_PORT[slot]
+        service = service_for(backend, slot)
+
+        # Single-occupancy per slot (host port) and per compose service
+        # (container). Each (backend, slot) pair maps to its own service, so
+        # e.g. a text model on vllm/primary and a vision model on
+        # vllm-secondary can coexist. Stop whichever other active model
+        # conflicts on either axis before starting this one.
+        for other_id in list(active["active"].keys()):
+            if other_id == args.model_id:
+                continue
+            other = active["active"][other_id]
+            other_service = other.get("service") or service_for(
+                other.get("backend", ""), other.get("slot", "primary")
+            )
+            if other.get("slot") == slot or other_service == service:
+                stop_backend_service(other_service)
+                del active["active"][other_id]
+
+        active["active"][args.model_id] = {
+            "slot": slot,
+            "backend": backend,
+            "service": service,
+            "port": host_port,
+            "served_model_name": served_name,
+        }
+        save_active(active)
+        render_override(active)
+        run(compose_argv("up", "-d", service, profile="models"))
+        render_litellm_config(active)
+    print(f"backend-start: {args.model_id} started (backend={backend}, slot={slot}, host_port={host_port})")
+    print("Run 'sudo spark-ai-ctl gateway-reload' to point the gateway at it once healthy.")
+    return 0
+
+
+def cmd_backend_stop(args: argparse.Namespace) -> int:
+    """Stop a model by id, or whichever model currently occupies `primary`/`secondary`.
+
+    Also removes it from active.json and runs a full gateway-reload so the
+    gateway stops routing to it.
+    """
+    with state_lock():
+        active = load_active()
+        target = args.target
+        if target in SLOT_HOST_PORT:
+            matches = [mid for mid, rec in active["active"].items() if rec.get("slot") == target]
+            if not matches:
+                raise SparkCtlError(f"no model is active in slot '{target}'")
+            model_id = matches[0]
+        else:
+            model_id = target
+            if model_id not in active["active"]:
+                raise SparkCtlError(f"model '{model_id}' is not active")
+
+        rec = active["active"][model_id]
+        stop_backend_service(
+            rec.get("service") or service_for(rec["backend"], rec.get("slot", "primary"))
+        )
+        del active["active"][model_id]
+        save_active(active)
+        render_override(active)
+        render_litellm_config(active)
+        run(compose_argv("up", "-d", "litellm"))
+        run(compose_argv("restart", "litellm"))
+    print(f"backend-stop: {model_id} stopped (was slot={rec['slot']}, backend={rec['backend']})")
+    return 0
+
+
+def cmd_status(args: argparse.Namespace) -> int:
+    """Read-only: active.json + `docker compose ps`. Machine-readable on --json."""
+    active = load_active()
+    result = subprocess.run(
+        compose_argv("ps", "--format", "json"), text=True, capture_output=True, check=False
+    )
+    ps_entries: list[Any] = []
+    raw = (result.stdout or "").strip()
+    if raw:
+        try:
+            parsed = json.loads(raw)
+            ps_entries = parsed if isinstance(parsed, list) else [parsed]
+        except json.JSONDecodeError:
+            # Some compose versions emit NDJSON (one object per line).
+            for line in raw.splitlines():
+                line = line.strip()
+                if not line:
+                    continue
+                with contextlib.suppress(json.JSONDecodeError):
+                    ps_entries.append(json.loads(line))
+
+    if args.json:
+        payload = {"active": active["active"], "updated": active.get("updated"), "compose_ps": ps_entries}
+        print(json.dumps(payload, indent=2, sort_keys=True))
+        return 0
+
+    print(f"active models (updated {active.get('updated')}):")
+    if not active["active"]:
+        print("  (none)")
+    for model_id, rec in sorted(active["active"].items()):
+        print(
+            f"  {model_id:<28} slot={rec.get('slot'):<10} "
+            f"backend={rec.get('backend'):<10} port={rec.get('port')}"
+        )
+    print()
+    print("compose ps:")
+    run(compose_argv("ps"), check=False)
+    return 0
+
+
+# --------------------------------------------------------------------------
+# sync — the human trust gate (docs/CONTRACTS.md §2.2)
+# --------------------------------------------------------------------------
+
+
+def cmd_sync(args: argparse.Namespace) -> int:
+    """Diff the repo's compose/catalog/template files against their
+    /etc/spark-ai-stack copies, then — after an explicit human confirmation
+    (or --yes) — copy them in and re-derive env.d. This is the ONLY verb that
+    reads from the untrusted repository, and it is excluded from the NOPASSWD
+    sudoers grant on purpose.
+    """
+    with state_lock():
+        changes: list[tuple[Path, Path, str]] = []
+        missing_sources: list[Path] = []
+
+        for repo_path, etc_path in SYNC_MAP:
+            if not repo_path.exists():
+                missing_sources.append(repo_path)
+                continue
+            new_text = repo_path.read_text(encoding="utf-8")
+            if etc_path.exists():
+                old_text = etc_path.read_text(encoding="utf-8")
+                if old_text == new_text:
+                    print(f"=== {etc_path}: unchanged ===")
+                    continue
+                print(f"=== {etc_path}: changed ===")
+                diff = difflib.unified_diff(
+                    old_text.splitlines(keepends=True),
+                    new_text.splitlines(keepends=True),
+                    fromfile=str(etc_path),
+                    tofile=str(repo_path),
+                )
+                sys.stdout.writelines(diff)
+            else:
+                print(f"=== {etc_path}: new file (source {repo_path}) ===")
+            changes.append((repo_path, etc_path, new_text))
+
+        if missing_sources:
+            print("Skipped (not present in the repo yet):", file=sys.stderr)
+            for path in missing_sources:
+                print(f"  {path}", file=sys.stderr)
+
+        if not changes:
+            print("Nothing to sync.")
+            return 0
+
+        if not args.yes:
+            if sys.stdin.isatty():
+                answer = input("Apply? [y/N] ").strip().lower()
+                if answer not in ("y", "yes"):
+                    print("Aborted; no changes applied.")
+                    return 1
+            else:
+                print(
+                    "spark-ai-ctl: refusing to apply sync changes without --yes (not a tty)",
+                    file=sys.stderr,
+                )
+                return 2
+
+        for _repo_path, etc_path, new_text in changes:
+            atomic_write(etc_path, new_text, 0o644)
+            print(f"synced: {etc_path}")
+
+        if SECRETS_FILE.exists():
+            secret_values = parse_env_file(SECRETS_FILE)
+            derive_env_d(secret_values)
+            print("env.d/*.env re-derived from existing secrets.env")
+        else:
+            print(
+                "secrets.env not found; run 'sudo spark-ai-ctl secrets-init' to create it",
+                file=sys.stderr,
+            )
+    return 0
+
+
+# --------------------------------------------------------------------------
+# argparse — enumerated verbs and choices= only (docs/CONTRACTS.md §2.3)
+# --------------------------------------------------------------------------
+
+
+def build_parser(main_ids: list[str], experimental_ids: list[str]) -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        prog="spark-ai-ctl",
+        description="Privileged control wrapper for spark-ai-stack (root-only).",
+    )
+    sub = parser.add_subparsers(dest="verb", required=True)
+
+    for verb in (
+        "core-up", "core-down", "core-restart", "core-ps",
+        "gateway-reload",
+        "monitoring-up", "monitoring-down",
+        "utilities-up", "utilities-down",
+        "secrets-init", "secrets-status",
+    ):
+        sub.add_parser(verb)
+
+    start_parser = sub.add_parser("backend-start")
+    start_choices = sorted(set(main_ids) | set(experimental_ids)) or None
+    start_parser.add_argument(
+        "model_id", choices=start_choices, metavar="MODEL_ID",
+        help="model id from models.yaml (or experimental.yaml with --experimental)",
+    )
+    start_parser.add_argument(
+        "--experimental", action="store_true",
+        help="allow a model id defined only in experimental.yaml",
+    )
+
+    stop_parser = sub.add_parser("backend-stop")
+    stop_choices = sorted(set(main_ids) | set(experimental_ids) | set(SLOT_HOST_PORT)) or None
+    stop_parser.add_argument("target", choices=stop_choices, metavar="MODEL_ID_OR_SLOT")
+
+    rotate_parser = sub.add_parser("secrets-rotate")
+    rotate_parser.add_argument("key", choices=SECRET_KEYS, metavar="KEY")
+
+    sync_parser = sub.add_parser("sync")
+    sync_parser.add_argument("--yes", action="store_true", help="apply without an interactive confirm")
+
+    status_parser = sub.add_parser("status")
+    status_parser.add_argument("--json", action="store_true")
+
+    return parser
+
+
+HANDLERS = {
+    "core-up": cmd_core_up,
+    "core-down": cmd_core_down,
+    "core-restart": cmd_core_restart,
+    "core-ps": cmd_core_ps,
+    "backend-start": cmd_backend_start,
+    "backend-stop": cmd_backend_stop,
+    "gateway-reload": cmd_gateway_reload,
+    "monitoring-up": cmd_monitoring_up,
+    "monitoring-down": cmd_monitoring_down,
+    "utilities-up": cmd_utilities_up,
+    "utilities-down": cmd_utilities_down,
+    "secrets-init": cmd_secrets_init,
+    "secrets-status": cmd_secrets_status,
+    "secrets-rotate": cmd_secrets_rotate,
+    "sync": cmd_sync,
+    "status": cmd_status,
+}
+
+
+def main(argv: list[str] | None = None) -> int:
+    if os.geteuid() != 0:
+        print("spark-ai-ctl: refuses to run: must be root (invoke via sudo)", file=sys.stderr)
+        return 1
+
+    main_ids, experimental_ids = discover_catalog_ids()
+    parser = build_parser(main_ids, experimental_ids)
+    args = parser.parse_args(argv if argv is not None else sys.argv[1:])
+    handler = HANDLERS[args.verb]
+
+    try:
+        return handler(args)
+    except SparkCtlError as exc:
+        print(f"spark-ai-ctl: {exc}", file=sys.stderr)
+        return exc.exit_code
+    except subprocess.CalledProcessError as exc:
+        printable_cmd = " ".join(exc.cmd) if isinstance(exc.cmd, list) else str(exc.cmd)
+        print(f"spark-ai-ctl: command failed ({exc.returncode}): {printable_cmd}", file=sys.stderr)
+        return 1
+    except OSError as exc:
+        print(f"spark-ai-ctl: {exc}", file=sys.stderr)
+        return 1
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

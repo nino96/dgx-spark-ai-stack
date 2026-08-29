@@ -75,10 +75,13 @@ human gate; the wrapper is new privileged code and gets line-by-line review.
   Consumed by privileged code from `/etc/spark-ai-stack/compose/`.
 - `compose/compose.yml` services:
   - Core (no profile): `litellm`, `openwebui`, `postgres`, `searxng`.
-  - `profiles: [models]`: `vllm`, `llamacpp`, `sglang` — skeletons only: image, GPU reservation,
-    `ipc: host`, volumes (HF cache for vllm/sglang; gguf dir for llamacpp), healthcheck,
-    `security_opt: [no-new-privileges:true]`, restart policy — **no `command:`, no `ports:`**
-    (both come from the wrapper-rendered override).
+  - `profiles: [models]`: `vllm`, `llamacpp`, `sglang` plus secondary-slot variants
+    `vllm-secondary` and `llamacpp-secondary` (anchor copies; own containers so a text primary
+    and a vision secondary can coexist; sglang is primary-only) — skeletons only: image, GPU
+    reservation, `ipc: host`, volumes (HF cache for vllm/sglang; gguf dir for llamacpp),
+    healthcheck, `security_opt: [no-new-privileges:true]`, restart policy — **no `command:`,
+    no `ports:`** (both come from the wrapper-rendered override). The wrapper maps
+    (backend, slot) → service: primary → `<backend>`, secondary → `<backend>-secondary`.
   - `profiles: [utilities]`: `embeddings` (llamacpp image serving an embedding GGUF), `whisper`
     (defined but may start as a documented stub).
 - Wrapper invocation shape (hardcoded inside `spark-ai-ctl`):
@@ -127,7 +130,7 @@ spark-ai-ctl status                       # active.json + compose ps, machine-re
 ## 6. Secrets (`/etc/spark-ai-stack/secrets.env`)
 
 Keys (fixed set): `LITELLM_MASTER_KEY`, `POSTGRES_PASSWORD`, `WEBUI_SECRET_KEY`,
-`SEARXNG_SECRET`, `HF_TOKEN`.
+`SEARXNG_SECRET`, `GRAFANA_ADMIN_PASSWORD`, `HF_TOKEN`.
 Per-service exposure (via per-service root-owned env files derived at `secrets-init`/`sync` time
 into `/etc/spark-ai-stack/env.d/<service>.env`, each 0600):
 - litellm: `LITELLM_MASTER_KEY`, `DATABASE_URL` (derived from POSTGRES_PASSWORD)

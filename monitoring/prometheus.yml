@@ -1,0 +1,68 @@
+# monitoring/prometheus.yml
+#
+# This file is synced by `sudo sparkctl sync` to
+# /etc/spark-ai-stack/compose/prometheus.yml and mounted read-only into the
+# prometheus container at /etc/prometheus/prometheus.yml by
+# compose/monitoring.yml. Editing THIS file has no effect on a running stack
+# until sync runs. See monitoring/README.md.
+
+global:
+  scrape_interval: 30s
+  scrape_timeout: 10s
+  evaluation_interval: 30s
+
+scrape_configs:
+  # Prometheus scraping itself.
+  - job_name: prometheus
+    static_configs:
+      - targets: ["127.0.0.1:9090"]
+
+  # Host metrics: CPU, memory (MemAvailable is the ground-truth GPU-memory-
+  # pressure signal on GB10 -- see README), disk, network, and whatever
+  # hwmon/thermal sensors the kernel exposes.
+  #
+  # node-exporter runs with `network_mode: host` and binds 127.0.0.1:9100 in
+  # the HOST network namespace (see compose/monitoring.yml). Prometheus itself
+  # runs on the project's default bridge network, so "127.0.0.1:9100" from
+  # inside the prometheus container would mean the container's own loopback,
+  # not the host's. Reach the host instead via the `host.docker.internal`
+  # extra_hosts entry (host-gateway) added to the prometheus service.
+  - job_name: node-exporter
+    static_configs:
+      - targets: ["host.docker.internal:9100"]
+
+  # vLLM backend slots (primary=8001, secondary=8002; see docs/CONTRACTS.md
+  # sect 3 port map). GB10 is unified-memory hardware: NVML/nvidia-smi report
+  # NO GPU memory stats, so these two targets -- not a GPU exporter -- are the
+  # authoritative source for model-serving telemetry (token throughput,
+  # TTFT/e2e latency, kv-cache occupancy, running/waiting queues).
+  #
+  # Both targets read DOWN in Prometheus whenever a slot has no model loaded
+  # (modelctl activates at most one model per slot). That is expected, not an
+  # alert condition.
+  - job_name: vllm
+    scrape_interval: 15s
+    metrics_path: /metrics
+    static_configs:
+      - targets: ["host.docker.internal:8001"]
+        labels:
+          slot: primary
+      - targets: ["host.docker.internal:8002"]
+        labels:
+          slot: secondary
+
+  # LiteLLM gateway metrics -- best-effort job, expected to be persistently
+  # DOWN until both of the following are true:
+  #   1. the `prometheus` callback is enabled in
+  #      config/litellm.template.yaml (owned by workstream C), and
+  #   2. litellm is reachable by its compose service name on the shared
+  #      bridge network. As of this writing compose/compose.yml runs litellm
+  #      with `network_mode: host`, in which case the bare service name
+  #      "litellm" will NOT resolve from inside the prometheus container --
+  #      swap the target below for "host.docker.internal:4000" if that
+  #      network mode persists after the compose refactor. See
+  #      monitoring/README.md for details.
+  - job_name: litellm
+    metrics_path: /metrics
+    static_configs:
+      - targets: ["litellm:4000"]

@@ -1,17 +1,15 @@
 [Unit]
-Description=spark-ai-stack gateway, UI, database, and search
-Wants=network-online.target
-After=network-online.target
+Description=spark-ai-stack core services (litellm, openwebui, postgres, searxng)
+After=docker.service network-online.target
+Wants=docker.service network-online.target
 
 [Service]
 Type=oneshot
 RemainAfterExit=yes
-ExecStart=%h/.local/bin/spark-ai-stack core-up
-ExecStop=%h/.local/bin/spark-ai-stack core-down
-Restart=on-failure
-RestartSec=10
-TimeoutStartSec=900
-TimeoutStopSec=180
+ExecStart=/usr/local/sbin/spark-ai-ctl core-up
+ExecStop=/usr/local/sbin/spark-ai-ctl core-down
+TimeoutStartSec=300
+TimeoutStopSec=120
 
 [Install]
-WantedBy=default.target
+WantedBy=multi-user.target

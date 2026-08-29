@@ -1,13 +1,23 @@
 [Unit]
-Description=spark-ai-stack boot model
-Wants=spark-ai-core.service
+Description=spark-ai-stack boot-model activation (runs modelctl ensure-boot as niyam-gb10)
 After=spark-ai-core.service
+Wants=spark-ai-core.service
 
 [Service]
 Type=oneshot
 RemainAfterExit=yes
-ExecStart=%h/.local/bin/spark-ai-modelctl ensure-boot
+User=niyam-gb10
+Group=niyam-gb10
+Environment=HOME=/home/niyam-gb10
+WorkingDirectory=/home/niyam-gb10/code/spark-ai-stack
+ExecStart=/home/niyam-gb10/code/spark-ai-stack/bin/modelctl ensure-boot
 TimeoutStartSec=1800
 
+# modelctl ensure-boot shells out to `sudo spark-ai-ctl backend-start/gateway-reload`
+# for the privileged steps. That works non-interactively here because
+# /etc/sudoers.d/spark-ai-stack grants niyam-gb10 NOPASSWD access to exactly
+# those spark-ai-ctl verbs (docs/CONTRACTS.md §5) — no password prompt is
+# possible or needed from this unit.
+
 [Install]
-WantedBy=default.target
+WantedBy=multi-user.target

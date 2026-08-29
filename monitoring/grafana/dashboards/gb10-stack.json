@@ -1,0 +1,471 @@
+{
+  "id": null,
+  "uid": "gb10-stack",
+  "title": "GB10 Stack",
+  "description": "Unified-memory, GPU, vLLM, and host telemetry for the spark-ai-stack on the ASUS Ascent GX10 (GB10). See monitoring/README.md for the NVML memory-stat gap.",
+  "tags": ["gb10", "spark-ai"],
+  "schemaVersion": 39,
+  "version": 1,
+  "editable": true,
+  "graphTooltip": 1,
+  "style": "dark",
+  "timezone": "",
+  "fiscalYearStartMonth": 0,
+  "time": { "from": "now-6h", "to": "now" },
+  "refresh": "30s",
+  "timepicker": {},
+  "templating": { "list": [] },
+  "annotations": { "list": [] },
+  "links": [],
+  "panels": [
+    {
+      "id": 1,
+      "type": "row",
+      "title": "Unified memory (GB10 has no NVML memory stats -- MemAvailable is ground truth)",
+      "collapsed": false,
+      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 0 },
+      "panels": []
+    },
+    {
+      "id": 2,
+      "type": "stat",
+      "title": "MemAvailable (GiB)",
+      "description": "node_memory_MemAvailable_bytes. This is the number modelctl budgets sum(budget_gib)+host_reserve_gib against (docs/CONTRACTS.md sect 7) -- it is the closest proxy this hardware has to free GPU memory.",
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "gridPos": { "h": 6, "w": 6, "x": 0, "y": 1 },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "decimals": 1,
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              { "color": "red", "value": null },
+              { "color": "yellow", "value": 15 },
+              { "color": "green", "value": 30 }
+            ]
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "reduceOptions": { "calcs": ["lastNotNull"], "fields": "", "values": false },
+        "orientation": "auto",
+        "textMode": "auto",
+        "colorMode": "value",
+        "graphMode": "area",
+        "justifyMode": "auto"
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "node_memory_MemAvailable_bytes / 1073741824",
+          "legendFormat": "MemAvailable"
+        }
+      ]
+    },
+    {
+      "id": 3,
+      "type": "stat",
+      "title": "Used = MemTotal - MemAvailable (GiB)",
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "gridPos": { "h": 6, "w": 6, "x": 6, "y": 1 },
+      "fieldConfig": {
+        "defaults": { "unit": "short", "decimals": 1 },
+        "overrides": []
+      },
+      "options": {
+        "reduceOptions": { "calcs": ["lastNotNull"], "fields": "", "values": false },
+        "orientation": "auto",
+        "textMode": "auto",
+        "colorMode": "value",
+        "graphMode": "area",
+        "justifyMode": "auto"
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "(node_memory_MemTotal_bytes - node_memory_MemAvailable_bytes) / 1073741824",
+          "legendFormat": "Used"
+        }
+      ]
+    },
+    {
+      "id": 4,
+      "type": "stat",
+      "title": "Swap used (GiB)",
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "gridPos": { "h": 6, "w": 6, "x": 12, "y": 1 },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "decimals": 2,
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              { "color": "green", "value": null },
+              { "color": "yellow", "value": 1 },
+              { "color": "red", "value": 8 }
+            ]
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "reduceOptions": { "calcs": ["lastNotNull"], "fields": "", "values": false },
+        "orientation": "auto",
+        "textMode": "auto",
+        "colorMode": "value",
+        "graphMode": "area",
+        "justifyMode": "auto"
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "(node_memory_SwapTotal_bytes - node_memory_SwapFree_bytes) / 1073741824",
+          "legendFormat": "Swap used"
+        }
+      ]
+    },
+    {
+      "id": 5,
+      "type": "text",
+      "title": "Per-model budgets",
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "gridPos": { "h": 6, "w": 6, "x": 18, "y": 1 },
+      "options": {
+        "mode": "markdown",
+        "content": "**Reading this row against modelctl budgets**\n\nEach catalog entry in `config/models.yaml` declares a `budget_gib`. modelctl's activation precheck requires:\n\n`sum(budget_gib of active models) + host_reserve_gib < MemAvailable-at-baseline`\n\nThere are no automatic threshold annotations on the timeseries panel (Grafana annotations need a data source of events, and budgets live in a YAML file, not a metric) -- cross-reference the current active set with `modelctl status` or `sparkctl status` when reading the dip below."
+      }
+    },
+    {
+      "id": 6,
+      "type": "timeseries",
+      "title": "MemAvailable over time (GiB)",
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 7 },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "custom": { "drawStyle": "line", "lineWidth": 1, "fillOpacity": 10, "spanNulls": true }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": { "displayMode": "list", "placement": "bottom" },
+        "tooltip": { "mode": "multi" }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "node_memory_MemAvailable_bytes / 1073741824",
+          "legendFormat": "MemAvailable"
+        },
+        {
+          "refId": "B",
+          "expr": "node_memory_MemTotal_bytes / 1073741824",
+          "legendFormat": "MemTotal"
+        }
+      ]
+    },
+    {
+      "id": 7,
+      "type": "timeseries",
+      "title": "Swap over time (GiB)",
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 7 },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "custom": { "drawStyle": "line", "lineWidth": 1, "fillOpacity": 10, "spanNulls": true }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": { "displayMode": "list", "placement": "bottom" },
+        "tooltip": { "mode": "multi" }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "(node_memory_SwapTotal_bytes - node_memory_SwapFree_bytes) / 1073741824",
+          "legendFormat": "Swap used"
+        }
+      ]
+    },
+    {
+      "id": 8,
+      "type": "row",
+      "title": "GPU",
+      "collapsed": false,
+      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 15 },
+      "panels": []
+    },
+    {
+      "id": 9,
+      "type": "text",
+      "title": "NVML gap on GB10",
+      "gridPos": { "h": 6, "w": 12, "x": 0, "y": 16 },
+      "options": {
+        "mode": "markdown",
+        "content": "**No NVML/nvidia-smi memory stats on GB10**\n\nGB10 is unified-memory hardware: `nvidia-smi` and NVML report **no GPU memory figures** (used/free/total all read back as unreliable or absent). GPU **memory** pressure is tracked entirely through host `MemAvailable` in the row above, which is also what modelctl's budget precheck uses.\n\nGPU **utilization, temperature, power, and clocks are available** via `nvidia-smi`, but there is **no DCGM or nvidia-exporter container in this monitoring profile** to scrape them into Prometheus -- adding one was deliberately skipped rather than shipping a broken/unsupported exporter for this hardware.\n\nThe panel to the right is a best-effort pull of whatever hwmon/thermal sensors node-exporter finds exposed by the kernel; it may be empty on this board. For live GPU utilization/power/clock spot checks, run:\n\n```\nwatch -n1 nvidia-smi\n```\n\ndirectly on the host."
+      }
+    },
+    {
+      "id": 10,
+      "type": "timeseries",
+      "title": "hwmon / thermal-zone temperatures (best-effort, node-exporter)",
+      "description": "node-exporter's hwmon and thermal_zone collectors, best-effort. Not guaranteed to include GPU die temperature on this board -- cross-check with `nvidia-smi --query-gpu=temperature.gpu --format=csv` on the host.",
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "gridPos": { "h": 6, "w": 12, "x": 12, "y": 16 },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "celsius",
+          "custom": { "drawStyle": "line", "lineWidth": 1, "fillOpacity": 5, "spanNulls": true }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": { "displayMode": "list", "placement": "bottom" },
+        "tooltip": { "mode": "multi" }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "node_hwmon_temp_celsius",
+          "legendFormat": "{{chip}} {{sensor}}"
+        },
+        {
+          "refId": "B",
+          "expr": "node_thermal_zone_temp",
+          "legendFormat": "zone {{zone}}"
+        }
+      ]
+    },
+    {
+      "id": 11,
+      "type": "row",
+      "title": "vLLM",
+      "collapsed": false,
+      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 22 },
+      "panels": []
+    },
+    {
+      "id": 12,
+      "type": "timeseries",
+      "title": "Token throughput (tokens/s)",
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 23 },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "custom": { "drawStyle": "line", "lineWidth": 1, "fillOpacity": 10, "spanNulls": true }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": { "displayMode": "list", "placement": "bottom" },
+        "tooltip": { "mode": "multi" }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum by (slot) (rate(vllm:generation_tokens_total[5m]))",
+          "legendFormat": "{{slot}} generation"
+        },
+        {
+          "refId": "B",
+          "expr": "sum by (slot) (rate(vllm:prompt_tokens_total[5m]))",
+          "legendFormat": "{{slot}} prompt"
+        }
+      ]
+    },
+    {
+      "id": 13,
+      "type": "timeseries",
+      "title": "TTFT / e2e latency (p50, p95)",
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 23 },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "s",
+          "custom": { "drawStyle": "line", "lineWidth": 1, "fillOpacity": 10, "spanNulls": true }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": { "displayMode": "list", "placement": "bottom" },
+        "tooltip": { "mode": "multi" }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "histogram_quantile(0.5, sum by (le, slot) (rate(vllm:time_to_first_token_seconds_bucket[5m])))",
+          "legendFormat": "{{slot}} TTFT p50"
+        },
+        {
+          "refId": "B",
+          "expr": "histogram_quantile(0.95, sum by (le, slot) (rate(vllm:time_to_first_token_seconds_bucket[5m])))",
+          "legendFormat": "{{slot}} TTFT p95"
+        },
+        {
+          "refId": "C",
+          "expr": "histogram_quantile(0.5, sum by (le, slot) (rate(vllm:e2e_request_latency_seconds_bucket[5m])))",
+          "legendFormat": "{{slot}} e2e p50"
+        },
+        {
+          "refId": "D",
+          "expr": "histogram_quantile(0.95, sum by (le, slot) (rate(vllm:e2e_request_latency_seconds_bucket[5m])))",
+          "legendFormat": "{{slot}} e2e p95"
+        }
+      ]
+    },
+    {
+      "id": 14,
+      "type": "timeseries",
+      "title": "Running / waiting requests",
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 31 },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "custom": { "drawStyle": "line", "lineWidth": 1, "fillOpacity": 10, "spanNulls": true }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": { "displayMode": "list", "placement": "bottom" },
+        "tooltip": { "mode": "multi" }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum by (slot) (vllm:num_requests_running)",
+          "legendFormat": "{{slot}} running"
+        },
+        {
+          "refId": "B",
+          "expr": "sum by (slot) (vllm:num_requests_waiting)",
+          "legendFormat": "{{slot}} waiting"
+        }
+      ]
+    },
+    {
+      "id": 15,
+      "type": "timeseries",
+      "title": "KV-cache usage (%)",
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 31 },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "percent",
+          "min": 0,
+          "max": 100,
+          "custom": { "drawStyle": "line", "lineWidth": 1, "fillOpacity": 10, "spanNulls": true }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": { "displayMode": "list", "placement": "bottom" },
+        "tooltip": { "mode": "multi" }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "vllm:gpu_cache_usage_perc * 100",
+          "legendFormat": "{{slot}} kv-cache"
+        }
+      ]
+    },
+    {
+      "id": 16,
+      "type": "row",
+      "title": "Host",
+      "collapsed": false,
+      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 39 },
+      "panels": []
+    },
+    {
+      "id": 17,
+      "type": "timeseries",
+      "title": "CPU usage (%)",
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "gridPos": { "h": 8, "w": 8, "x": 0, "y": 40 },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "percent",
+          "min": 0,
+          "max": 100,
+          "custom": { "drawStyle": "line", "lineWidth": 1, "fillOpacity": 10, "spanNulls": true }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": { "displayMode": "list", "placement": "bottom" },
+        "tooltip": { "mode": "multi" }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "100 - (avg by (instance) (rate(node_cpu_seconds_total{mode=\"idle\"}[5m])) * 100)",
+          "legendFormat": "CPU busy"
+        }
+      ]
+    },
+    {
+      "id": 18,
+      "type": "timeseries",
+      "title": "Disk free on / (GiB)",
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "gridPos": { "h": 8, "w": 8, "x": 8, "y": 40 },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "custom": { "drawStyle": "line", "lineWidth": 1, "fillOpacity": 10, "spanNulls": true }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": { "displayMode": "list", "placement": "bottom" },
+        "tooltip": { "mode": "multi" }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "node_filesystem_avail_bytes{mountpoint=\"/\"} / 1073741824",
+          "legendFormat": "free"
+        }
+      ]
+    },
+    {
+      "id": 19,
+      "type": "timeseries",
+      "title": "Network throughput (bytes/s)",
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "gridPos": { "h": 8, "w": 8, "x": 16, "y": 40 },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "Bps",
+          "custom": { "drawStyle": "line", "lineWidth": 1, "fillOpacity": 10, "spanNulls": true }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": { "displayMode": "list", "placement": "bottom" },
+        "tooltip": { "mode": "multi" }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "rate(node_network_receive_bytes_total{device!~\"lo|veth.*|docker.*|br-.*\"}[5m])",
+          "legendFormat": "{{device}} rx"
+        },
+        {
+          "refId": "B",
+          "expr": "rate(node_network_transmit_bytes_total{device!~\"lo|veth.*|docker.*|br-.*\"}[5m])",
+          "legendFormat": "{{device}} tx"
+        }
+      ]
+    }
+  ]
+}

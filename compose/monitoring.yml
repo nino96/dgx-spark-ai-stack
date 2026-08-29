@@ -1,0 +1,108 @@
+# compose/monitoring.yml
+#
+# Optional monitoring overlay for the spark-ai-stack. NOT started by default;
+# brought up with `sparkctl monitoring up` (-> `sudo spark-ai-ctl
+# monitoring-up`), which invokes:
+#
+#   docker compose --project-name spark-ai \
+#     -f /etc/spark-ai-stack/compose/compose.yml \
+#     -f /etc/spark-ai-stack/compose/monitoring.yml \
+#     up -d
+#
+# This file is consumed ONLY from its synced, root-owned copy at
+# /etc/spark-ai-stack/compose/monitoring.yml (docs/CONTRACTS.md sect 2/4).
+# Editing the copy in this repo has no effect until `sudo sparkctl sync` runs.
+#
+# No top-level `name:` or `networks:` here -- this overlay joins whatever
+# project name and default bridge network compose/compose.yml defines
+# (project name `spark-ai` per docs/CONTRACTS.md sect 4). All three services
+# below bind loopback-only, per the sect 2 security invariant.
+#
+# Image digests are NOT yet pinned in config/versions.lock.yaml (that file is
+# owned by workstream C) -- flagged in monitoring/README.md for follow-up.
+
+services:
+  prometheus:
+    image: prom/prometheus:v3.0.1
+    container_name: spark-ai-prometheus
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:9090:9090"
+    volumes:
+      # Synced from monitoring/prometheus.yml -- see monitoring/README.md.
+      - /etc/spark-ai-stack/compose/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - spark-ai-prometheus:/prometheus
+    command:
+      - --config.file=/etc/prometheus/prometheus.yml
+      - --storage.tsdb.path=/prometheus
+      - --storage.tsdb.retention.time=15d
+      - --web.listen-address=0.0.0.0:9090
+    extra_hosts:
+      # node-exporter runs on network_mode: host; vllm slots are exposed as
+      # 127.0.0.1:<port> host port mappings. Both are reachable from this
+      # bridge-networked container via the host gateway.
+      - "host.docker.internal:host-gateway"
+    security_opt:
+      - no-new-privileges:true
+    depends_on: []
+
+  node-exporter:
+    image: prom/node-exporter:v1.9.0
+    container_name: spark-ai-node-exporter
+    restart: unless-stopped
+    pid: host
+    # network_mode: host so the process can bind the host's loopback
+    # directly at 127.0.0.1:9100 (see docs/CONTRACTS.md sect 3/6 -- every
+    # service is loopback-only). `ports:` has no effect under network_mode:
+    # host and is intentionally omitted; the bind address comes from
+    # --web.listen-address below.
+    network_mode: host
+    volumes:
+      - /proc:/host/proc:ro
+      - /sys:/host/sys:ro
+      - /:/rootfs:ro
+    command:
+      - --path.procfs=/host/proc
+      - --path.sysfs=/host/sys
+      - --path.rootfs=/rootfs
+      - --web.listen-address=127.0.0.1:9100
+      - --collector.filesystem.mount-points-exclude=^/(sys|proc|dev|host|etc)($$|/)
+    security_opt:
+      - no-new-privileges:true
+
+  grafana:
+    image: grafana/grafana-oss:11.4.0
+    container_name: spark-ai-grafana
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:3001:3000"
+    depends_on:
+      - prometheus
+    # Optional per-service secret file. Not created by `spark-ai-ctl
+    # secrets-init` today (see monitoring/README.md integration note) --
+    # `required: false` (Compose v2.24+/v5 syntax) means grafana starts fine
+    # without it, falling back to Grafana's own built-in admin/admin default.
+    env_file:
+      - path: /etc/spark-ai-stack/env.d/grafana.env
+        required: false
+    environment:
+      # Served at /grafana via `tailscale serve` (docs/CONTRACTS.md sect 8).
+      GF_SERVER_ROOT_URL: "%(protocol)s://%(domain)s/grafana"
+      GF_SERVER_SERVE_FROM_SUB_PATH: "true"
+      # Anonymous viewer access for tailnet convenience -- read-only, no
+      # admin capability. Editing dashboards/datasources still requires the
+      # admin login (see GF_SECURITY_ADMIN_PASSWORD note above / README).
+      GF_AUTH_ANONYMOUS_ENABLED: "true"
+      GF_AUTH_ANONYMOUS_ORG_ROLE: "Viewer"
+      GF_AUTH_ANONYMOUS_ORG_NAME: "Main Org."
+    volumes:
+      - spark-ai-grafana:/var/lib/grafana
+      # Synced from monitoring/grafana/provisioning/ -- see monitoring/README.md.
+      - /etc/spark-ai-stack/compose/grafana/provisioning:/etc/grafana/provisioning:ro
+      - /etc/spark-ai-stack/compose/grafana/dashboards:/var/lib/grafana/dashboards:ro
+    security_opt:
+      - no-new-privileges:true
+
+volumes:
+  spark-ai-grafana:
+  spark-ai-prometheus:

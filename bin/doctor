@@ -1,9 +1,15 @@
 #!/usr/bin/env python3
-"""Read-only host, artifact, network, and service diagnostics."""
+"""Read-only diagnostics for spark-ai-stack. Never requires sudo; degrades
+gracefully (WARN, not FAIL/crash) whenever a privileged or optional check
+cannot be performed. See docs/CONTRACTS.md §9.
+
+Exit code: 0 if no check FAILed, 1 otherwise (WARN never fails the run).
+"""
 
 from __future__ import annotations
 
 import argparse
+import datetime as dt
 import hashlib
 import json
 import os
@@ -13,174 +19,174 @@ import shutil
 import stat
 import subprocess
 import sys
-from typing import Any
+from typing import Any, Callable
 import urllib.error
 import urllib.request
+
+import yaml
 
 
 ROOT = Path(__file__).resolve().parents[1]
 DATA_ROOT = Path(os.environ.get("SPARK_AI_DATA_ROOT", "~/ai-data")).expanduser()
-SECRETS_FILE = Path(
-    os.environ.get(
-        "SPARK_AI_SECRETS_FILE", "~/.config/spark-ai-stack/secrets.env"
-    )
-).expanduser()
-LOCKS = json.loads((ROOT / "config" / "versions.lock.yaml").read_text())
-SERVICE_PORTS = {3000, 4000, 5432, 8001, 8002, 8003, 8888}
+STATE_ROOT = DATA_ROOT / "state"
+BASELINE_FILE = STATE_ROOT / "baseline.json"
+ACTIVE_FILE = STATE_ROOT / "active.json"
+
+MODELS_FILE = ROOT / "config" / "models.yaml"
+VERSIONS_FILE = ROOT / "config" / "versions.lock.yaml"
+
+ETC_ROOT = Path("/etc/spark-ai-stack")
+
+# Port map from docs/CONTRACTS.md §3 -- everything must bind 127.0.0.1 only.
+SERVICE_PORTS = {
+    3000: "openwebui",
+    3001: "grafana",
+    4000: "litellm",
+    8001: "model-primary",
+    8002: "model-secondary",
+    8010: "whisper",
+    8011: "embeddings",
+    8888: "searxng",
+    9090: "prometheus",
+    9100: "node_exporter",
+}
+
+PASS, WARN, FAIL = "PASS", "WARN", "FAIL"
 
 
-def command(
-    arguments: list[str], timeout: int = 20
-) -> subprocess.CompletedProcess[str]:
+class Check:
+    def __init__(self, name: str, status: str, detail: str) -> None:
+        self.name = name
+        self.status = status
+        self.detail = detail
+
+    def to_dict(self) -> dict[str, Any]:
+        return {"name": self.name, "status": self.status, "detail": self.detail}
+
+
+def run(args: list[str], timeout: int = 20) -> subprocess.CompletedProcess[str]:
     try:
-        return subprocess.run(
-            arguments, text=True, capture_output=True, timeout=timeout, check=False
-        )
+        return subprocess.run(args, text=True, capture_output=True, timeout=timeout, check=False)
     except (OSError, subprocess.TimeoutExpired) as error:
-        return subprocess.CompletedProcess(arguments, 127, "", str(error))
+        return subprocess.CompletedProcess(args, 127, "", str(error))
 
 
-def read(path: str) -> str:
+def read_text(path: str | Path) -> str:
     try:
         return Path(path).read_text(encoding="utf-8", errors="replace").strip()
     except OSError:
         return ""
 
 
-def meminfo() -> dict[str, int]:
-    result: dict[str, int] = {}
-    for line in read("/proc/meminfo").splitlines():
-        key, raw = line.split(":", 1)
-        fields = raw.strip().split()
-        if fields and fields[0].isdigit():
-            result[key] = int(fields[0]) * 1024
-    return result
-
-
-def probe_url(url: str, headers: dict[str, str] | None = None) -> int | None:
-    request = urllib.request.Request(url, headers=headers or {})
+def probe(url: str, timeout: float = 2.0) -> int | None:
     try:
-        with urllib.request.urlopen(request, timeout=2) as response:
+        with urllib.request.urlopen(url, timeout=timeout) as response:
             return response.status
     except urllib.error.HTTPError as error:
         return error.code
-    except (urllib.error.URLError, TimeoutError):
+    except (urllib.error.URLError, TimeoutError, ValueError):
         return None
 
 
-def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--full", action="store_true", help="include expensive runtime/artifact tests")
-    parser.add_argument("--verify-images", action="store_true", help="verify the LiteLLM cosign signature")
-    parser.add_argument("--json", action="store_true")
-    return parser.parse_args()
+def meminfo() -> dict[str, int]:
+    values: dict[str, int] = {}
+    for line in read_text("/proc/meminfo").splitlines():
+        key, _, raw = line.partition(":")
+        fields = raw.strip().split()
+        if fields and fields[0].isdigit():
+            values[key] = int(fields[0]) * 1024
+    return values
 
 
-def main() -> int:
-    args = parse_args()
-    results: list[dict[str, Any]] = []
+# ---------------------------------------------------------------------------
+# Individual checks -- each returns a Check(name, PASS|WARN|FAIL, detail)
+# ---------------------------------------------------------------------------
 
-    def add(name: str, ok: bool, detail: str, severity: str = "error") -> None:
-        results.append(
-            {"name": name, "ok": bool(ok), "detail": detail, "severity": severity}
-        )
-
+def check_platform() -> Check:
     arch = os.uname().machine
-    add("architecture", arch == "aarch64", arch)
+    if arch != "aarch64":
+        return Check("platform_arch", FAIL, f"expected aarch64, got {arch}")
+    vendor = read_text("/sys/class/dmi/id/sys_vendor")
+    product = read_text("/sys/class/dmi/id/product_name")
+    is_gx10 = "ASUSTeK" in vendor and "GX10" in product
+    is_dgx_spark = "NVIDIA" in vendor and "DGX" in product and "Spark" in product
+    if not (is_gx10 or is_dgx_spark):
+        return Check("platform_arch", WARN, f"unrecognized DMI: {vendor} {product}".strip())
+    return Check("platform_arch", PASS, f"{arch} ({vendor} {product})".strip())
 
-    vendor = read("/sys/class/dmi/id/sys_vendor")
-    product = read("/sys/class/dmi/id/product_name")
-    asus = "ASUSTeK" in vendor and "GX10" in product
-    nvidia = "NVIDIA" in vendor and "DGX" in product and "Spark" in product
-    add("supported_dmi", asus or nvidia, f"{vendor} {product}".strip())
 
-    dgx_release = read("/etc/dgx-release")
-    safe_dgx_fields = (
-        "DGX_NAME=",
-        "DGX_SWBUILD_VERSION=",
-        "DGX_PLATFORM=",
-        "DGX_OTA_VERSION=",
-    )
-    dgx_summary = " | ".join(
-        line for line in dgx_release.splitlines() if line.startswith(safe_dgx_fields)
-    )
-    add(
-        "dgx_release",
-        bool(dgx_release) and "DGX" in dgx_release.upper(),
-        dgx_summary or "missing",
-    )
+def check_os_release() -> Check:
+    os_release = read_text("/etc/os-release")
+    ubuntu_24 = "ID=ubuntu" in os_release and bool(re.search(r'VERSION_ID="?24\.04', os_release))
+    pretty = next((line for line in os_release.splitlines() if line.startswith("PRETTY_NAME=")), "unknown")
+    return Check("os_release", PASS if ubuntu_24 else WARN, pretty)
 
-    os_release = read("/etc/os-release")
-    ubuntu_24 = 'ID=ubuntu' in os_release and re.search(r'VERSION_ID="?24\.04', os_release)
-    add("ubuntu_24_04", bool(ubuntu_24), next((line for line in os_release.splitlines() if line.startswith("PRETTY_NAME=")), "unknown"))
 
+def check_cuda() -> Check:
+    nvcc = run(["nvcc", "--version"])
+    if nvcc.returncode != 0:
+        return Check("cuda_13", WARN, "nvcc not found or failed")
+    ok = "release 13." in nvcc.stdout
+    tail = " | ".join(nvcc.stdout.strip().splitlines()[-2:])
+    return Check("cuda_13", PASS if ok else WARN, tail)
+
+
+def check_driver() -> Check:
+    smi = run(["nvidia-smi", "--query-gpu=name,driver_version,compute_cap", "--format=csv,noheader"])
+    detail = (smi.stdout or smi.stderr).strip()
+    return Check("nvidia_driver", PASS if smi.returncode == 0 else WARN, detail or "nvidia-smi failed")
+
+
+def check_mem_baseline() -> Check:
     info = meminfo()
-    total_gib = info.get("MemTotal", 0) / 1024**3
     available_gib = info.get("MemAvailable", 0) / 1024**3
-    add("unified_memory", total_gib >= 118, f"total={total_gib:.1f} GiB available={available_gib:.1f} GiB")
+    total_gib = info.get("MemTotal", 0) / 1024**3
+    if not BASELINE_FILE.exists():
+        return Check(
+            "mem_baseline",
+            WARN,
+            f"no baseline captured (run `doctor --capture-baseline` at idle); "
+            f"current MemAvailable={available_gib:.1f} GiB of {total_gib:.1f} GiB total",
+        )
+    try:
+        baseline = json.loads(BASELINE_FILE.read_text(encoding="utf-8"))
+        baseline_gib = float(baseline["mem_available_gib"])
+    except (OSError, json.JSONDecodeError, KeyError, ValueError) as error:
+        return Check("mem_baseline", WARN, f"baseline.json unreadable: {error}")
+    delta = available_gib - baseline_gib
+    return Check(
+        "mem_baseline",
+        PASS,
+        f"baseline={baseline_gib:.1f} GiB (captured {baseline.get('timestamp', '?')}), "
+        f"current={available_gib:.1f} GiB, delta={delta:+.1f} GiB",
+    )
 
+
+def check_disk_space() -> Check:
     disk_path = DATA_ROOT if DATA_ROOT.exists() else Path.home()
     free_gib = shutil.disk_usage(disk_path).free / 1024**3
-    add("disk_free", free_gib >= 150, f"{free_gib:.1f} GiB at {disk_path}", "warning")
+    status = PASS if free_gib >= 150 else WARN
+    return Check("disk_free", status, f"{free_gib:.1f} GiB free at {disk_path}")
 
-    smi = command(["nvidia-smi", "--query-gpu=name,compute_cap", "--format=csv,noheader"])
-    gpu_detail = (smi.stdout or smi.stderr).strip()
-    add("gb10_compute", smi.returncode == 0 and ("12.1" in gpu_detail or "GB10" in gpu_detail), gpu_detail or "nvidia-smi failed")
 
-    nvcc = command(["nvcc", "--version"])
-    cuda_detail = (nvcc.stdout or nvcc.stderr).strip().splitlines()
-    cuda_text = " | ".join(cuda_detail[-2:])
-    add("cuda_13", nvcc.returncode == 0 and "release 13." in nvcc.stdout, cuda_text or "nvcc failed")
-
-    for executable in ["docker", "tailscale", "git", "cmake", "openssl"]:
-        path = shutil.which(executable)
-        add(f"command_{executable}", bool(path), path or "missing")
-
-    docker = command(["docker", "info"])
-    add("docker_daemon", docker.returncode == 0, (docker.stderr or "reachable").strip())
-    compose = command(["docker", "compose", "version"])
-    add("docker_compose", compose.returncode == 0, (compose.stdout or compose.stderr).strip())
-
-    toolkit = command(["nvidia-ctk", "--version"])
-    add("nvidia_container_toolkit", toolkit.returncode == 0, (toolkit.stdout or toolkit.stderr).strip())
-
-    tailscale = command(["tailscale", "status", "--json"])
-    add("tailscale_connected", tailscale.returncode == 0, "connected" if tailscale.returncode == 0 else tailscale.stderr.strip())
-
-    if SECRETS_FILE.exists():
-        mode = stat.S_IMODE(SECRETS_FILE.stat().st_mode)
-        add("secrets_mode", mode == 0o600, f"{SECRETS_FILE} mode={mode:04o}")
-        content = SECRETS_FILE.read_text(encoding="utf-8")
-        required = all(
-            re.search(rf"^{key}=.+$", content, re.MULTILINE)
-            for key in (
-                "LITELLM_MASTER_KEY",
-                "PG_SUPERUSER",
-                "PG_SUPERPASS",
-                "WEBUI_SECRET_KEY",
-                "SEARXNG_SECRET",
-            )
+def check_secrets_status() -> Check:
+    if not shutil.which("sudo"):
+        return Check("secrets_status", WARN, "sudo not found; skipping")
+    completed = run(["sudo", "-n", "spark-ai-ctl", "secrets-status"], timeout=10)
+    if completed.returncode != 0:
+        return Check(
+            "secrets_status",
+            WARN,
+            "sudo -n spark-ai-ctl secrets-status unavailable "
+            f"(rc={completed.returncode}); skipping -- run interactively if needed",
         )
-        add("secrets_required_values", required, "required values set" if required else "missing/empty required value")
-    else:
-        add("secrets_file", False, f"missing: {SECRETS_FILE}")
+    return Check("secrets_status", PASS, completed.stdout.strip()[-500:])
 
-    pinned = [
-        entry["reference"]
-        for entry in LOCKS["images"].values()
-        if "reference" in entry
-    ]
-    add("image_digests", all("@sha256:" in reference for reference in pinned), ", ".join(pinned))
-    add(
-        "image_platform_locks",
-        all(entry.get("platform") == "linux/arm64" for entry in LOCKS["images"].values()),
-        ", ".join(
-            f"{name}={entry.get('platform', 'missing')}"
-            for name, entry in LOCKS["images"].items()
-        ),
-    )
 
-    listeners = command(["ss", "-H", "-lnt"])
+def check_loopback_boundary() -> Check:
+    listeners = run(["ss", "-tlnH"])
+    if listeners.returncode != 0:
+        return Check("loopback_boundary", WARN, f"`ss` failed: {listeners.stderr.strip()}")
     exposed: list[str] = []
     for line in listeners.stdout.splitlines():
         fields = line.split()
@@ -188,153 +194,228 @@ def main() -> int:
             continue
         local = fields[3]
         match = re.search(r":(\d+)$", local)
-        if not match or int(match.group(1)) not in SERVICE_PORTS:
+        if not match:
+            continue
+        port = int(match.group(1))
+        if port not in SERVICE_PORTS:
             continue
         host = local[: match.start()]
         if host in {"0.0.0.0", "*", "[::]", "::"}:
-            exposed.append(local)
-    add("loopback_boundary", not exposed, "no wildcard listeners" if not exposed else ", ".join(exposed))
+            exposed.append(f"{local} ({SERVICE_PORTS[port]})")
+    if exposed:
+        return Check("loopback_boundary", FAIL, "non-loopback stack listener(s): " + ", ".join(exposed))
+    return Check("loopback_boundary", PASS, "no stack port bound outside 127.0.0.1")
 
-    gateway_status = probe_url("http://127.0.0.1:4000/v1/models")
-    if gateway_status is not None:
-        add("gateway_rejects_missing_key", gateway_status == 401, f"HTTP {gateway_status}")
-    search_status = probe_url("http://127.0.0.1:8888/search/?q=health&format=json")
-    if search_status is not None:
-        add("searxng_health", search_status == 200, f"HTTP {search_status}")
-    webui_status = probe_url("http://127.0.0.1:3000/health")
-    if webui_status is not None:
-        add("open_webui_health", webui_status == 200, f"HTTP {webui_status}")
-    postgres = command(
-        ["docker", "inspect", "--format", "{{.State.Health.Status}}", "spark-ai-postgres"]
-    )
-    if postgres.returncode == 0:
-        add("postgres_health", postgres.stdout.strip() == "healthy", postgres.stdout.strip())
 
-    if args.verify_images or args.full:
-        cosign = shutil.which("cosign")
-        add("cosign_installed", bool(cosign), cosign or "missing")
-        image = LOCKS["images"]["litellm"]
-        public_key = Path(image["public_key_path"])
-        public_key_digest = (
-            hashlib.sha256(public_key.read_bytes()).hexdigest()
-            if public_key.is_file()
-            else "missing"
+def check_docker_group() -> Check:
+    groups = run(["id", "-nG"]).stdout.split()
+    if "docker" in groups:
+        return Check(
+            "docker_group_membership",
+            WARN,
+            "user is in the docker group; per docs/CONTRACTS.md §2 this must be removed at cutover",
         )
-        key_ok = public_key_digest == image["public_key_sha256"]
-        add("litellm_public_key", key_ok, f"{public_key}: {public_key_digest}")
-        if cosign and key_ok:
-            verified = command(
-                [
-                    cosign,
-                    "verify",
-                    "--key",
-                    image["public_key_path"],
-                    image["release_index_reference"],
-                ],
-                timeout=120,
-            )
-            add("litellm_signature", verified.returncode == 0, (verified.stderr or verified.stdout)[-1000:].strip())
-            signed_index = command(
-                [
-                    "docker",
-                    "buildx",
-                    "imagetools",
-                    "inspect",
-                    "--raw",
-                    image["release_index_reference"],
-                ],
-                timeout=120,
-            )
-            deployed_digest = image["reference"].rsplit("@", 1)[-1]
-            add(
-                "litellm_signed_index_member",
-                signed_index.returncode == 0
-                and deployed_digest in signed_index.stdout,
-                deployed_digest,
-            )
+    return Check("docker_group_membership", PASS, "user is not in the docker group")
 
-    if args.full:
-        for image_name, image in LOCKS["images"].items():
-            inspected = command(
-                [
-                    "docker",
-                    "image",
-                    "inspect",
-                    "--format",
-                    "{{.Architecture}}",
-                    image["reference"],
-                ],
-                timeout=120,
-            )
-            add(
-                f"arm64_image_{image_name}",
-                inspected.returncode == 0 and inspected.stdout.strip() == "arm64",
-                (inspected.stderr or inspected.stdout).strip(),
-                "warning" if image.get("optional") else "error",
-            )
 
-        gpu_image = LOCKS["images"]["vllm_base"]["reference"]
-        gpu = command(
-            ["docker", "run", "--rm", "--gpus", "all", "--entrypoint", "nvidia-smi", gpu_image],
-            timeout=120,
-        )
-        add("gpu_container", gpu.returncode == 0, (gpu.stderr or gpu.stdout)[-1000:].strip())
+def _sync_pair(repo_path: Path, etc_path: Path) -> Check:
+    name = f"sync_{repo_path.name}"
+    if not repo_path.exists():
+        return Check(name, WARN, f"repo copy missing: {repo_path}")
+    if not etc_path.exists():
+        return Check(name, WARN, f"{etc_path} missing; run `sparkctl sync`")
+    try:
+        etc_bytes = etc_path.read_bytes()
+    except PermissionError:
+        # §1: /etc/spark-ai-stack/* is root:root 0644 except secrets.env/env.d
+        # (0600). Anything else being unreadable violates that assumption.
+        return Check(name, WARN, f"{etc_path} is not readable by this user (unexpected mode?)")
+    except OSError as error:
+        return Check(name, WARN, f"{etc_path} unreadable: {error}")
+    repo_hash = hashlib.sha256(repo_path.read_bytes()).hexdigest()
+    etc_hash = hashlib.sha256(etc_bytes).hexdigest()
+    if repo_hash != etc_hash:
+        return Check(name, WARN, f"{etc_path} differs from repo copy; run `sparkctl sync`")
+    return Check(name, PASS, f"{etc_path} matches repo")
 
-        fastapi = command(
-            [
-                "docker",
-                "run",
-                "--rm",
-                "--entrypoint",
-                "python3",
-                "local/spark-ai-vllm:26.06-fastapi136",
-                "-c",
-                "import fastapi; print(fastapi.__version__)",
-            ],
-            timeout=120,
-        )
-        fastapi_version = fastapi.stdout.strip()
-        add(
-            "vllm_fastapi_pin",
-            fastapi.returncode == 0
-            and fastapi_version == LOCKS["python"]["fastapi_workaround"],
-            (fastapi.stderr or fastapi.stdout)[-1000:].strip(),
-        )
 
-        verification = command([str(ROOT / "bin" / "modelctl"), "verify", "all", "--json"], timeout=3600)
-        add("model_artifacts", verification.returncode == 0, (verification.stderr or verification.stdout)[-2000:].strip())
-
-        llama_binary = DATA_ROOT / "builds" / "llama.cpp" / "bin" / "llama-server"
-        add("llama_sm121_binary", os.access(llama_binary, os.X_OK), str(llama_binary))
-        llama_cache = DATA_ROOT / "builds" / "llama.cpp" / "CMakeCache.txt"
-        llama_cache_text = read(str(llama_cache))
-        add(
-            "llama_sm121_configuration",
-            "CMAKE_CUDA_ARCHITECTURES:STRING=121" in llama_cache_text,
-            str(llama_cache),
-        )
-        ds4_binary = DATA_ROOT / "src" / "ds4" / "ds4-server"
-        add("ds4_cuda_binary", os.access(ds4_binary, os.X_OK), str(ds4_binary))
-        ds4_stamp = DATA_ROOT / "src" / "ds4" / ".spark-ai-build-commit"
-        ds4_commit = LOCKS["sources"]["ds4"]["commit"]
-        add("ds4_cuda_build_stamp", read(str(ds4_stamp)) == ds4_commit, str(ds4_stamp))
-
-        for unit in ("spark-ai-core.service", "spark-ai-boot-model.service"):
-            enabled = command(["systemctl", "--user", "is-enabled", unit])
-            add(f"enabled_{unit}", enabled.returncode == 0, (enabled.stdout or enabled.stderr).strip())
-
-    failures = [
-        result
-        for result in results
-        if not result["ok"] and result["severity"] == "error"
+def check_sync_freshness() -> list[Check]:
+    if not ETC_ROOT.exists():
+        return [Check("sync_freshness", WARN, f"{ETC_ROOT} missing; `sparkctl sync` has not run yet")]
+    # Mirrors security/spark-ai-ctl's SYNC_MAP (docs/CONTRACTS.md §1, §5).
+    pairs = [
+        (MODELS_FILE, ETC_ROOT / "models.yaml"),
+        (ROOT / "config" / "experimental.yaml", ETC_ROOT / "experimental.yaml"),
+        (ROOT / "compose" / "compose.yml", ETC_ROOT / "compose" / "compose.yml"),
+        (ROOT / "compose" / "monitoring.yml", ETC_ROOT / "compose" / "monitoring.yml"),
+        (ROOT / "config" / "litellm.template.yaml", ETC_ROOT / "compose" / "litellm.template.yaml"),
+        (ROOT / "config" / "searxng-settings.yml", ETC_ROOT / "compose" / "searxng-settings.yml"),
     ]
+    return [_sync_pair(repo_path, etc_path) for repo_path, etc_path in pairs]
+
+
+def check_core_services() -> list[Check]:
+    checks = []
+    litellm_status = probe("http://127.0.0.1:4000/health/readiness")
+    checks.append(Check("core_litellm", PASS if litellm_status == 200 else WARN, f"HTTP {litellm_status}"))
+    openwebui_status = probe("http://127.0.0.1:3000/")
+    checks.append(Check("core_openwebui", PASS if openwebui_status else WARN, f"HTTP {openwebui_status}"))
+    searxng_status = probe("http://127.0.0.1:8888/search")
+    checks.append(Check("core_searxng", PASS if searxng_status else WARN, f"HTTP {searxng_status}"))
+    return checks
+
+
+def check_active_models() -> list[Check]:
+    if not ACTIVE_FILE.exists():
+        return [Check("active_models", WARN, f"{ACTIVE_FILE} missing (nothing activated yet?)")]
+    try:
+        state = json.loads(ACTIVE_FILE.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as error:
+        return [Check("active_models", WARN, f"{ACTIVE_FILE} unreadable: {error}")]
+    active = state.get("active", [])
+    if not active:
+        return [Check("active_models", WARN, "no model currently active")]
+    try:
+        catalog = yaml.safe_load(MODELS_FILE.read_text(encoding="utf-8")) or {}
+        models = catalog.get("models", {})
+    except OSError:
+        models = {}
+    slot_ports = {"primary": 8001, "secondary": 8002}
+    checks = []
+    total_budget = 0.0
+    for name in active:
+        model = models.get(name)
+        if not model:
+            checks.append(Check(f"active_{name}", WARN, "model not found in config/models.yaml"))
+            continue
+        port = slot_ports.get(model.get("slot"))
+        path = "/health" if model.get("backend") in {"llamacpp", "llamacpp-fork"} else "/v1/models"
+        status = probe(f"http://127.0.0.1:{port}{path}") if port else None
+        budget = model.get("budget_gib") or 0
+        total_budget += float(budget)
+        checks.append(
+            Check(f"active_{name}", PASS if status == 200 else WARN, f"HTTP {status}, budget_gib={budget}")
+        )
+    available_gib = meminfo().get("MemAvailable", 0) / 1024**3
+    checks.append(
+        Check(
+            "active_budget_vs_available",
+            PASS if total_budget <= available_gib + total_budget else WARN,
+            f"declared budgets sum={total_budget:.1f} GiB, current MemAvailable={available_gib:.1f} GiB",
+        )
+    )
+    return checks
+
+
+def check_tailscale() -> Check:
+    if not shutil.which("tailscale"):
+        return Check("tailscale_serve", WARN, "tailscale not installed")
+    completed = run(["tailscale", "serve", "status", "--json"])
+    if completed.returncode != 0:
+        return Check("tailscale_serve", WARN, (completed.stderr or "tailscale serve status failed").strip())
+    try:
+        config = json.loads(completed.stdout or "{}")
+    except json.JSONDecodeError:
+        return Check("tailscale_serve", WARN, "could not parse tailscale serve status")
+    if not config:
+        return Check("tailscale_serve", WARN, "no Serve configuration; run `sparkctl tailscale-configure --yes`")
+    return Check("tailscale_serve", PASS, "Serve configuration present")
+
+
+def _find_image_pins(node: Any, path: str = "") -> list[tuple[str, dict[str, Any]]]:
+    """Recursively find every {repository, tag, ...} leaf under config/versions.lock.yaml's
+    `images:` tree (schema 2 nests some entries, e.g. images.llamacpp.builder_base)."""
+    found: list[tuple[str, dict[str, Any]]] = []
+    if not isinstance(node, dict):
+        return found
+    if "repository" in node and "tag" in node:
+        found.append((path or "<root>", node))
+    for key, value in node.items():
+        if isinstance(value, dict):
+            found.extend(_find_image_pins(value, f"{path}.{key}" if path else key))
+    return found
+
+
+def check_image_digests() -> Check:
+    if not VERSIONS_FILE.exists():
+        return Check("image_digests", WARN, f"{VERSIONS_FILE} missing")
+    try:
+        locks = yaml.safe_load(VERSIONS_FILE.read_text(encoding="utf-8")) or {}
+    except OSError as error:
+        return Check("image_digests", WARN, f"could not read {VERSIONS_FILE}: {error}")
+    pins = _find_image_pins(locks.get("images", {}))
+    if not pins:
+        return Check("image_digests", WARN, "no image pins found in versions.lock.yaml")
+    unpinned = [name for name, entry in pins if not entry.get("digest")]
+    if unpinned:
+        return Check(
+            "image_digests",
+            WARN,
+            f"{len(unpinned)}/{len(pins)} image(s) not yet digest-pinned (digest: null): {', '.join(unpinned)}",
+        )
+    return Check("image_digests", PASS, f"all {len(pins)} images in versions.lock.yaml are digest-pinned")
+
+
+def capture_baseline() -> int:
+    STATE_ROOT.mkdir(parents=True, exist_ok=True)
+    active = json.loads(ACTIVE_FILE.read_text(encoding="utf-8")).get("active", []) if ACTIVE_FILE.exists() else []
+    if active:
+        print(
+            f"doctor: warning: {active} is currently active; a baseline should be captured "
+            "at idle (core services up, no models active) for accurate budget math",
+            file=sys.stderr,
+        )
+    available_gib = meminfo().get("MemAvailable", 0) / 1024**3
+    payload = {
+        "mem_available_gib": round(available_gib, 3),
+        "timestamp": dt.datetime.now(dt.timezone.utc).isoformat(),
+    }
+    BASELINE_FILE.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    print(f"doctor: baseline captured: {payload}")
+    return 0
+
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--json", action="store_true")
+    parser.add_argument(
+        "--capture-baseline",
+        action="store_true",
+        help="write ~/ai-data/state/baseline.json from current MemAvailable and exit",
+    )
+    return parser.parse_args()
+
+
+def main() -> int:
+    args = parse_args()
+    if args.capture_baseline:
+        return capture_baseline()
+
+    checks: list[Check] = [
+        check_platform(),
+        check_os_release(),
+        check_cuda(),
+        check_driver(),
+        check_mem_baseline(),
+        check_disk_space(),
+        check_secrets_status(),
+        check_loopback_boundary(),
+        check_docker_group(),
+        *check_sync_freshness(),
+        *check_core_services(),
+        *check_active_models(),
+        check_tailscale(),
+        check_image_digests(),
+    ]
+
+    failures = [check for check in checks if check.status == FAIL]
     if args.json:
-        print(json.dumps({"ok": not failures, "checks": results}, indent=2, sort_keys=True))
+        print(json.dumps({"ok": not failures, "checks": [check.to_dict() for check in checks]}, indent=2, sort_keys=True))
     else:
-        for result in results:
-            marker = "PASS" if result["ok"] else ("WARN" if result["severity"] == "warning" else "FAIL")
-            print(f"{marker:<4} {result['name']:<30} {result['detail']}")
-        print(f"\n{len(results) - len(failures)}/{len(results)} checks without fatal errors.")
+        for check in checks:
+            print(f"{check.status:<4} {check.name:<32} {check.detail}")
+        warnings = sum(1 for check in checks if check.status == WARN)
+        print(f"\n{len(checks)} checks: {len(failures)} FAIL, {warnings} WARN.")
     return 1 if failures else 0
 
 

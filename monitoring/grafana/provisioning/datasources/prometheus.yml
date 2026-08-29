@@ -1,0 +1,20 @@
+# Grafana datasource provisioning. Synced by `sudo sparkctl sync` to
+# /etc/spark-ai-stack/compose/grafana/provisioning/datasources/prometheus.yml
+# and mounted read-only into the grafana container at
+# /etc/grafana/provisioning/datasources/prometheus.yml.
+apiVersion: 1
+
+datasources:
+  - name: Prometheus
+    uid: prometheus
+    type: prometheus
+    access: proxy
+    # "prometheus" is the compose service name; both containers share the
+    # project's default bridge network, so plain service-name DNS works here
+    # (unlike node-exporter, which runs on network_mode: host).
+    url: http://prometheus:9090
+    isDefault: true
+    editable: false
+    jsonData:
+      timeInterval: 30s
+      httpMethod: POST
