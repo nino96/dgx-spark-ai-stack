@@ -6,9 +6,29 @@ from __future__ import annotations
 import argparse
 import json
 import os
+from pathlib import Path
 import sys
 import urllib.error
 import urllib.request
+
+import yaml
+
+
+ROOT = Path(__file__).resolve().parents[1]
+DEFAULT_BASE_URL = "http://127.0.0.1:4000/v1"
+DEFAULT_SEARCH_URL = "http://127.0.0.1:8888/search"
+
+
+def default_model() -> str | None:
+    """Resolve the boot: true model from config/models.yaml, if present."""
+    try:
+        catalog = yaml.safe_load((ROOT / "config" / "models.yaml").read_text(encoding="utf-8")) or {}
+    except OSError:
+        return None
+    for name, spec in (catalog.get("models") or {}).items():
+        if spec.get("boot"):
+            return spec.get("served_model_name", name)
+    return None
 
 
 def request(url: str, key: str | None = None, body: dict | None = None) -> tuple[int, bytes]:
@@ -45,9 +65,21 @@ def request_and_cancel(url: str, key: str, body: dict) -> tuple[int, bytes]:
 
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--base-url", required=True, help="for example https://host/v1")
-    parser.add_argument("--model", required=True)
-    parser.add_argument("--search-url", required=True, help="for example https://host/search/")
+    parser.add_argument(
+        "--base-url",
+        default=DEFAULT_BASE_URL,
+        help=f"OpenAI-compatible base URL (default: {DEFAULT_BASE_URL}, the loopback LiteLLM gateway)",
+    )
+    parser.add_argument(
+        "--model",
+        default=None,
+        help="served model name to exercise (default: the catalog's boot: true model)",
+    )
+    parser.add_argument(
+        "--search-url",
+        default=DEFAULT_SEARCH_URL,
+        help=f"SearXNG search endpoint (default: {DEFAULT_SEARCH_URL})",
+    )
     parser.add_argument(
         "--active-model",
         action="append",
@@ -63,6 +95,11 @@ def main() -> int:
     parser.add_argument("--key-env", default="LITELLM_MASTER_KEY")
     parser.add_argument("--responses", action="store_true")
     args = parser.parse_args()
+    if args.model is None:
+        args.model = default_model()
+        if args.model is None:
+            print("--model was not given and no boot: true model was found in config/models.yaml", file=sys.stderr)
+            return 2
     key = os.environ.get(args.key_env)
     if not key:
         print(f"{args.key_env} is empty", file=sys.stderr)

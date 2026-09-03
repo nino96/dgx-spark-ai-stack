@@ -1,241 +1,266 @@
 # Operations
 
-## Bootstrap and converge
+Day-to-day runbook. Binding spec: `docs/CONTRACTS.md`. Threat model behind the
+`sudo`/`bin/sparkctl` split: `docs/SECURITY.md`.
+
+## Start / stop core
 
 ```bash
-./bootstrap
-bin/stack secrets-init --import-hf-token   # optional import, never printed
-${EDITOR:-nano} ~/.config/spark-ai-stack/secrets.env
-bin/stack apply
+bin/sparkctl core up          # sudo spark-ai-ctl core-up   -- litellm, openwebui, postgres, searxng
+bin/sparkctl core status      # sudo spark-ai-ctl core-ps   -- docker compose ps for the whole project
+bin/sparkctl core restart
+bin/sparkctl core down        # stops containers, does NOT remove volumes
 ```
 
-The playbook is designed to be rerun. Use `bin/stack check` before a change and
-`bin/stack apply` twice during acceptance; the second run must report no
-changes. Ansible refuses unsupported DMI/OS/GPU/CUDA baselines and provides no
-production bypass. Use vendor recovery or OTA before trying again.
+`core up`/`down`/`restart`/`status` are NOPASSWD sudoers entries (no password
+prompt once `bootstrap.sh` has run). At boot, `spark-ai-core.service` runs
+`core-up` and `spark-ai-boot-model.service` runs `bin/modelctl ensure-boot`
+after it (see `systemd/*.service`).
 
-`stack apply` installs user units and enables linger. The core unit starts
-PostgreSQL, LiteLLM, Open WebUI, and SearXNG; the boot-model unit ensures Qwen
-is active after Docker is ready, without a graphical or SSH login.
-
-## Secrets
+## Activate / swap models
 
 ```bash
-bin/stack secrets-init
-chmod 0600 ~/.config/spark-ai-stack/secrets.env
+bin/modelctl catalog                                   # every model + fits_now vs current MemAvailable
+bin/modelctl fetch <model>                             # download HF snapshot or GGUF+drafter
+bin/modelctl verify <model|all>                        # sha256 / snapshot-dir checks
+bin/modelctl activate <model>                          # swap the model occupying its slot
+bin/modelctl activate <model> --with <model2>          # e.g. a text primary + a vision secondary
+bin/modelctl activate <model> --experimental           # required for anything in config/experimental.yaml
+bin/modelctl activate <model> --skip-sanity            # skip the post-activation sanity gate (debugging only)
+bin/modelctl deactivate <model|all>
 ```
 
-The command preserves existing values and fills missing LiteLLM, PostgreSQL,
-Open WebUI, and SearXNG values with cryptographically random strings. It derives
-separate mode-`0600` per-service environment files under `~/ai-data/state`, so
-containers receive only the credentials they need. Provider keys are passed
-only to LiteLLM. `--import-hf-token` reads the existing
-`~/.huggingface/token` only when `HF_TOKEN` is empty. Never copy the prior
-SearXNG secret from `~/Documents`.
+`activate` is transactional: it validates slot/role/tested-pair rules and the
+memory budget, verifies GGUF artifacts, stops whatever conflicts on the same
+slot or the same backend/container, starts the requested model(s), waits for
+health, runs the fast sanity probe set (`basic, template, repetition, stop,
+tool_call`) unless `--skip-sanity`, reloads the LiteLLM gateway, and only then
+commits the new active set. Any failure at any step rolls back to the
+previous active set and restarts it automatically — nothing to clean up by
+hand.
 
-Clients send the LiteLLM value as `Authorization: Bearer <key>`. Rotate it by
-editing the secrets file and running `bin/stack core-restart`.
-Do not rotate `PG_SUPERPASS` by editing the environment file: PostgreSQL uses
-that variable only to initialize a new data directory. Change the database
-role password transactionally and update the secret in the same maintenance
-window. Open WebUI admin bootstrap values are likewise not a password-reset
-mechanism after the database exists.
+**Text + vision pair rule**: at most two models active at once, one per slot
+(`primary` → `:8001`, `secondary` → `:8002`). A pair is only admitted if:
 
-For the separate HPT640 application migration, do not initialize target
-secrets first; follow [HPT640_MIGRATION.md](HPT640_MIGRATION.md), which
-preserves the existing LiteLLM/Open WebUI secrets and databases.
+1. the two models declare different `slot` values, and
+2. either they have different `role` (`text`/`vision`/`utility` — this is the
+   normal one-big-model + vision-pair shape), **or** the exact pair (by
+   model-id set) appears in `config/models.yaml` `tested_pairs:` with
+   `status: passed`.
 
-## Existing GX10 migration
+Two models on the *same* backend (e.g. two `vllm` entries) can never run
+concurrently regardless of slot — `backend` maps to one compose service per
+slot, and starting one stops any other active model on that same service.
 
-`bin/stack migrate` is non-destructive and idempotent. It:
-
-1. Creates the `~/ai-data` layout.
-2. Adopts the known DS4 base and drafter from `~/gguf` using hard links if
-   possible, otherwise a copy, and then verifies both hashes.
-3. Copies `vllm-hf-cache` into `~/ai-data/huggingface` through the pinned NGC
-   image with the old volume mounted read-only.
-4. Records a migration report without copying credentials or tailnet IPs.
-
-It does not stop old services. `stack apply` checks port 8888: if the old
-`searxng` owns it, the playbook stops that specific container immediately
-before bringing up `spark-ai-searxng`. Old sources, unit files, images, model
-paths, and the Docker volume remain available for rollback.
-
-## Model lifecycle
+**"One-big-model + text-vision pair"** in practice:
 
 ```bash
-bin/modelctl catalog [--json]
-bin/modelctl fetch MODEL [--json]
-bin/modelctl verify MODEL|all [--json]
-bin/modelctl activate MODEL [--default] [--json]
-bin/modelctl deactivate MODEL [--json]
-bin/modelctl status [--json]
-bin/modelctl logs MODEL
+bin/modelctl activate qwen3.6-35b --with qwen3.8-27b   # text primary + vision secondary
 ```
 
-The cloud portfolio uses stable intent aliases so clients do not need to track
-provider model names. Review the checked-in selection and compare its identity,
-pricing, and required capabilities with the live catalog using:
+`qwen3.6-35b`/`qwen3.6-27b`/`nemotron-3.5-lightning-30b` are all `role: text,
+slot: primary` — only one of them can ever be active at a time (same slot).
+`qwen3.8-27b` is `role: vision, slot: secondary` and can pair with any of
+them without a `tested_pairs:` entry, since the roles differ.
+
+## Soak-testing a same-role pair into `tested_pairs`
+
+Same-role pairs (e.g. two text models, one per slot) need explicit soak
+approval before `activate --with` will admit them:
 
 ```bash
-bin/cloud-models list
-bin/cloud-models check
+# 1. baseline
+free -b; sudo spark-ai-ctl core-ps
+
+# 2. temporarily add the pair to config/models.yaml's tested_pairs: in a worktree, e.g.
+#    tested_pairs:
+#      - {models: [qwen3.6-35b, deepseek-v4-flash], status: passed}
+sudo spark-ai-ctl sync              # land the temporary catalog change in /etc
+
+# 3. admit both, then soak
+bin/modelctl activate qwen3.6-35b
+bin/modelctl activate deepseek-v4-flash --with qwen3.6-35b
+tests/soak/run.sh                   # see tests/soak/README.md; run >= 30 min, mixed prompt lengths
+
+# 4. watch MemAvailable, swap, journalctl -k, both backend logs, cancellation
+#    behavior. Fail on any restart, OOM/CUDA/NVRM error, swap growth, or a
+#    MemAvailable drop below host_reserve_gib (10 GiB by default).
 ```
 
-See [CLOUD_MODELS.md](CLOUD_MODELS.md) for selection criteria and promotion.
+Revert the temporary `tested_pairs:` edit and re-sync immediately if the gate
+fails — `modelctl` otherwise treats the pair as exclusive. Only commit the
+`tested_pairs:` entry (with the soak report) once it genuinely passes; see
+`tests/soak/README.md`.
 
-Activation validates the lockfile identity, artifact, available-memory floor,
-declared budgets, and pair allowlist. It then performs the transactional state
-transition described in `ARCHITECTURE.md`. Health timeouts are longer for the
-large models. A failed transition restores services, route config, and state.
-
-Examples:
+## Check health
 
 ```bash
-# Normal default
-bin/modelctl activate qwen3.6-35b --default
+bin/doctor                    # read-only; platform, memory baseline, disk, secrets presence,
+                               # loopback boundary, docker-group membership, sync freshness,
+                               # core service health, active-model health, tailscale serve,
+                               # image digest pins. Exit 0 unless a check FAILs (WARN never fails).
+bin/doctor --json
+bin/doctor --capture-baseline # write ~/ai-data/state/baseline.json from CURRENT MemAvailable --
+                               # run this at idle (core up, no models active) right after core-up,
+                               # before activating anything, so budget math has a real baseline
 
-# Small model; this stops Qwen while the pair gate is pending
-bin/modelctl activate qwen3.5-4b-gguf
+bin/modelctl status           # active set + live health + mem_available_gib (JSON: --json)
+bin/modelctl sanity <model>   # full sanity probe set (incl. long_context, vision) against an
+                               # already-active model
 
-# Exclusive DS4 switch; local/default follows it
-bin/modelctl activate deepseek-v4-flash --default
-
-# Stops DS4 and restores Qwen
-bin/modelctl deactivate deepseek-v4-flash
+bin/sparkctl acceptance       # python3 tests/acceptance.py -- unified endpoint + SearXNG checks
+                               # (needs LITELLM_MASTER_KEY in the environment; see below)
 ```
 
-## Logs and health
+`tests/acceptance.py` flags: `--base-url` (default
+`http://127.0.0.1:4000/v1`), `--model` (default: the catalog's `boot: true`
+model), `--search-url` (default `http://127.0.0.1:8888/search`),
+`--active-model` (repeatable, expected visible aliases for a concurrent
+profile), `--key-env` (default `LITELLM_MASTER_KEY` — the env var name to
+read the bearer key from), `--responses` (also exercise `/v1/responses`).
+Run it with the real master key in the environment. `secrets-status` never
+prints values (docs/CONTRACTS.md §5) — read the value with your own sudo
+password, then export it for the shell running acceptance:
 
 ```bash
-bin/stack status
-bin/doctor --full
-bin/modelctl logs qwen3.6-35b
-bin/modelctl logs qwen3.5-4b-gguf
-bin/modelctl logs deepseek-v4-flash
-docker logs -f spark-ai-litellm
-docker logs -f spark-ai-open-webui
-docker logs -f spark-ai-postgres
-docker logs -f spark-ai-searxng
+sudo cat /etc/spark-ai-stack/secrets.env | grep ^LITELLM_MASTER_KEY=   # password prompt
+export LITELLM_MASTER_KEY='<the value printed above>'
+bin/sparkctl acceptance
 ```
 
-Loopback checks:
+If you'd rather not read the value at all, `sudo spark-ai-ctl secrets-rotate
+LITELLM_MASTER_KEY` generates a fresh one (invalidates every existing
+client's key; re-derives `env.d/*.env` automatically) — same `sudo cat` step
+afterward to retrieve it.
+
+Note: `bin/doctor` takes only `--json` and `--capture-baseline` — there is no
+`--full` flag. `bin/modelctl sanity <model>` is the equivalent "run everything"
+check for a single active model.
+
+## Logs
+
+The `niyam-gb10` user has no `docker` group membership after
+`bootstrap.sh --harden` (see `docs/SECURITY.md`), so `bin/modelctl logs`
+cannot exec `docker` itself — it prints the command to run:
 
 ```bash
-curl -fsS -H "Authorization: Bearer $LITELLM_MASTER_KEY" \
-  http://127.0.0.1:4000/v1/models
-curl -fsS 'http://127.0.0.1:8888/search/?q=spark&format=json'
-curl -fsS http://127.0.0.1:3000/health
-ss -lntp
-free -h
+bin/modelctl logs qwen3.6-35b            # -> prints: sudo docker logs --tail=200 spark-ai-vllm
+bin/modelctl logs qwen3.6-35b -f         # -> prints: sudo docker logs -f spark-ai-vllm
+
+# run the printed command yourself:
+sudo docker logs --tail=200 spark-ai-vllm
+sudo docker logs -f spark-ai-litellm
+sudo docker logs -f spark-ai-searxng
 ```
 
-The host must show listeners at `127.0.0.1:3000`, `:4000`, `:5432`,
-`:8001`/`:8002`/`:8003` as active, and `:8888`; never `0.0.0.0` for these
-ports. On GB10, monitor
-`MemAvailable`, swap growth, and process RSS because aggregate GPU memory may
-show `N/A`.
+Container names by backend: `spark-ai-vllm` / `spark-ai-vllm-secondary`,
+`spark-ai-llamacpp` / `spark-ai-llamacpp-secondary`, `spark-ai-sglang`;
+core: `spark-ai-litellm`, `spark-ai-openwebui`, `spark-ai-postgres`,
+`spark-ai-searxng`. Experimental backends (`ds4`, `llamacpp-fork`) run as
+their own systemd units, not containers — use `journalctl -u <unit>` for
+those (`modelctl logs` prints this hint too).
 
-## Tailscale Serve
+Per-backend metrics, when the backend exposes them: `http://127.0.0.1:<slot
+port>/metrics` (loopback only; `modelctl logs` prints this line when it
+detects a live `/metrics` endpoint).
 
-Join the tailnet interactively first; this repository does not store an auth
-key. Then run:
+## Memory budgeting on GB10
+
+`nvidia-smi`/NVML report no usable GPU memory figures on GB10 (unified
+memory) — all budgeting comes from `/proc/meminfo` `MemAvailable`, both in
+`bin/modelctl` and in `bin/doctor`.
+
+- Concurrency rule: `sum(budget_gib of active models) + host_reserve_gib <
+  MemAvailable-at-baseline` (`host_reserve_gib` defaults to 10 GiB,
+  `config/models.yaml` `defaults:`).
+- **Capture a baseline right after core-up, before activating anything**:
+  `bin/doctor --capture-baseline` writes
+  `~/ai-data/state/baseline.json` from the *current* `MemAvailable`. Do this
+  at idle — `doctor` warns (but still writes) if a model is already active
+  when you capture it, since that would understate what's really available.
+- `bin/modelctl catalog` shows `fits_now` per model against *current*
+  `MemAvailable` (not the baseline) as a quick sanity check, but the real
+  admission check at `activate` time uses the baseline file if one exists,
+  falling back to current `MemAvailable` plus the budgets of whatever's
+  already active.
+- `bin/doctor`'s `mem_baseline` check reports the delta between the captured
+  baseline and current `MemAvailable` — a growing negative delta with no
+  models active suggests a leak worth investigating outside this stack.
+
+## Monitoring profile
 
 ```bash
-bin/stack tailscale-configure
-tailscale serve status
+bin/sparkctl monitoring up      # sudo spark-ai-ctl monitoring-up -- prometheus :9090,
+                                 # node_exporter :9100, grafana :3001
+bin/sparkctl monitoring down
 ```
 
-The command resets only the local Serve configuration and establishes HTTPS
-proxies for `/` to Open WebUI, `/v1` to port 4000, and `/search/` to port 8888. It never invokes
-`tailscale funnel`, and it aborts if Tailscale has no MagicDNS DNS name.
+Not started by default and not a core dependency. Grafana comes up
+pre-provisioned with a Prometheus datasource and one dashboard (`GB10 Stack`,
+uid `gb10-stack`) — no manual setup. Reachable on the tailnet at `/grafana`
+once `bin/sparkctl tailscale-configure --yes` has run *and* monitoring is up
+(the dry-run/apply script probes `127.0.0.1:3001` before adding that mount).
+Login is Grafana's own built-in `admin`/`admin` unless
+`GRAFANA_ADMIN_PASSWORD` has been set in `secrets.env` — change it on first
+login either way. See `monitoring/README.md` for scrape-target and dashboard
+maintenance, and the "no NVML on GB10" note that shapes the memory panel
+(GPU utilization/power/clocks are `nvidia-smi`-only; there's no exporter for
+them here — `watch -n1 nvidia-smi` on the host for that).
 
-Test from another tailnet node:
+## Utilities profile
 
 ```bash
-curl -i https://HOSTNAME/v1/models                    # must be 401
-curl -fsS -H 'Authorization: Bearer KEY' \
-  https://HOSTNAME/v1/models
-curl -fsS 'https://HOSTNAME/search/?q=test&format=json'
+bin/sparkctl utilities up       # sudo spark-ai-ctl utilities-up
+bin/sparkctl utilities down
 ```
 
-Subnet routing and exit-node duties are separate and opt-in. See
-[HPT640_MIGRATION.md](HPT640_MIGRATION.md); normal Serve configuration does
-not advertise either.
+- `embeddings` (`:8011`) reuses the llamacpp image in `--embedding` mode. It
+  is a **placeholder**: the compose skeleton points at
+  `/models/gguf/embeddings.gguf`, which does not ship with this repo — put an
+  actual embedding GGUF at `~/ai-data/models/gguf/embeddings.gguf` (a copy or
+  symlink) before bringing utilities up, or the container will fail to start.
+- `whisper` (`:8010`) is a **TODO stub** — fully commented out in
+  `compose/compose.yml` as of this writing because no confirmed aarch64 +
+  CUDA 13 speech-to-text image is pinned yet. `utilities-up`/`down` silently
+  skip it until a base image is chosen and the service is uncommented (see
+  the comment block in `compose/compose.yml` for the exact TODO).
 
-## Optional DNS
+## SearXNG usage by the t640's LiteLLM
 
-Pi-hole and AdGuard Home are separate, mutually exclusive Compose profiles.
-They are never started by the core unit or `stack apply`. `bin/dnsctl` handles
-private configuration, preflight, lifecycle, backup, and pinned updates:
+Port 8888 was deliberately kept from the legacy stack so the only change the
+t640's LiteLLM needs is a URL, not a port:
+
+```
+http://127.0.0.1:8888/search?format=json          # local (from this box)
+https://gx10-b210.<tailnet>.ts.net/search/?format=json   # from the t640, over the tailnet
+```
+
+`config/searxng-settings.yml` enables the `json` output format specifically
+for this consumer (`html` is also enabled, for interactive browser use via
+`/search` through OpenWebUI's web-search integration). See
+`docs/MIGRATION-T640.md` for the exact cutover-time URL change on the t640
+side.
+
+## lm-eval runs and compare
 
 ```bash
-bin/dnsctl init
-bin/dnsctl preflight
-bin/dnsctl up pihole           # or: adguard
-bin/dnsctl backup
-bin/dnsctl update-active
-bin/dnsctl down
+bin/modelctl eval qwen3.6-35b --tasks arc_easy,gsm8k_cot --limit 50
+# equivalent to: evals/lm-eval/run.sh qwen3.6-35b 8001 --tasks arc_easy,gsm8k_cot --limit 50
+
+python3 evals/lm-eval/compare.py qwen3.6-35b            # newest vs. previous archived run
+python3 evals/lm-eval/compare.py qwen3.6-35b --last 5   # compare across the last 5 runs
 ```
 
-Do not run these commands until you have reviewed the address binding, client
-cutover, and rollback procedure in [DNS_OPTIONS.md](DNS_OPTIONS.md).
-
-## Concurrency soak gate
-
-The initial Qwen+llama combination is `pending`. Follow
-`tests/soak/README.md`, save the results, and require:
-
-- both health endpoints and the gateway remain responsive;
-- `MemAvailable` never crosses the 8 GiB reserve;
-- swap does not grow from its pre-test baseline;
-- no OOM, NVIDIA, CUDA, or service restart errors occur;
-- streaming cancellation releases work promptly.
-
-Only then change the combination status to `passed` in
-`config/concurrency.yaml` in a reviewed commit.
-
-## Upgrades
-
-For the routine one-command workflow, backup contents, version-promotion gate,
-and rollback procedure, see [UPGRADES.md](UPGRADES.md):
-
-```bash
-bin/stack backup
-bin/update
-```
-
-`bin/update` also backs up and recreates an active optional DNS profile. It
-does nothing to DNS when neither profile is active.
-
-No component follows a floating tag. Upgrade one class of input per branch:
-
-1. Change the lockfile revision, commit, or image digest.
-2. Rebuild or fetch without deleting the old artifact.
-3. Run static tests, signature checks, backend contract tests, and soak tests.
-4. Activate transactionally and reboot-test.
-5. Commit the new evidence with the lockfile change.
-
-For an NGC vLLM upgrade, test the image *without* the FastAPI layer. FastAPI
-0.137 introduced a path-less router object that older vLLM metrics middleware
-did not handle, causing every request to return 500. Upstream fixed this in
-[vLLM PR #45629](https://github.com/vllm-project/vllm/pull/45629). Remove the
-pin only when the candidate image contains that fix and passes `/health`,
-`/metrics`, `/v1/models`, chat, streaming, and 20 concurrent requests.
-
-## Rollback and cleanup
-
-If activation fails, `modelctl` rolls back automatically. For operator-driven
-rollback:
-
-```bash
-bin/stack core-down
-systemctl --user disable --now spark-ai-core.service spark-ai-boot-model.service
-# Re-enable the old units/containers using the pre-migration notes.
-```
-
-Do not clean old assets until the new stack passes parity and a reboot.
-`bin/cleanup-legacy` is deliberately separate, dry-runs by default, and
-requires both `--execute` and `--i-confirm-parity`. It retires known old
-service names but does not delete GGUFs, source trees, images, or volumes; those
-remain a manual retention decision.
+On-demand and human-triggered only — never run automatically post-activation
+(that's what `evals/sanity/` is for). Runs the pinned `lm-evaluation-harness`
+container via `sudo docker` by default (the post-hardening user has no
+`docker` group membership, and eval runs are not in the NOPASSWD sudoers
+list — this is an accepted tradeoff, not a bug). To avoid docker/sudo
+entirely: `pip install 'lm_eval[api]==0.4.12'` in your own venv, then
+`LM_EVAL_LOCAL=1 evals/lm-eval/run.sh <model> <port> ...`. Results archive to
+`~/ai-data/state/evals/<model>/<UTC timestamp>.json`. Scores are only
+meaningful compared against a *previous run of the same model on this same
+stack* — never against upstream leaderboard numbers (different weights,
+quantization, and harness config). See `evals/lm-eval/README.md` for task
+suggestions and runtime expectations (`arc_easy`: minutes; `gsm8k_cot
+--limit 50`: several minutes; unlimited generation tasks: 30+ minutes).

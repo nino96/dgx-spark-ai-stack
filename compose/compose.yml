@@ -1,50 +1,112 @@
-name: spark-ai-stack
+# spark-ai-stack core + backend-skeleton + utilities compose file.
+#
+# Consumed ONLY from the root-owned copy at /etc/spark-ai-stack/compose/compose.yml
+# (synced there by `sudo spark-ai-ctl sync` — see docs/CONTRACTS.md §1/§2). The wrapper
+# invokes this as:
+#   docker compose --project-name spark-ai -f /etc/spark-ai-stack/compose/compose.yml
+#     [-f /etc/spark-ai-stack/compose/monitoring.yml] [-f /run/spark-ai-stack/override.yaml] <verb>
+#
+# Backend services (vllm/llamacpp/sglang) are intentionally skeletons: no `command:`,
+# no `ports:`. Both are supplied by the wrapper-rendered
+# /run/spark-ai-stack/override.yaml at `spark-ai-ctl backend-start` time (see
+# docs/CONTRACTS.md §2.4, §5). Every published port binds 127.0.0.1 only (§2.6).
+
+name: spark-ai
+
+secrets:
+  postgres_password:
+    file: /etc/spark-ai-stack/env.d/postgres_password
+
+volumes:
+  spark-ai-pgdata: {}
+  spark-ai-openwebui: {}
 
 services:
+  # ---------------------------------------------------------------------------
+  # Core services (no profile) — always up as part of `spark-ai-ctl core-up`.
+  # ---------------------------------------------------------------------------
+
   postgres:
-    image: docker.io/library/postgres:16.10@sha256:d6128f87af47b927176b6e957e6b722624f87d772afa61f3cd1e2f0e52117dcf
+    image: postgres:17
+    platform: linux/arm64
     container_name: spark-ai-postgres
     restart: unless-stopped
-    env_file:
-      - ${SPARK_AI_DATA_ROOT:-${HOME}/ai-data}/state/postgres.env
     environment:
-      POSTGRES_DB: postgres
+      POSTGRES_USER: litellm
+      POSTGRES_DB: litellm
+      POSTGRES_PASSWORD_FILE: /run/secrets/postgres_password
+    secrets:
+      - postgres_password
+    volumes:
+      - spark-ai-pgdata:/var/lib/postgresql/data
+    # No published ports — postgres is only reachable from other containers on
+    # the compose network (litellm's DATABASE_URL uses the service name).
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U $${POSTGRES_USER} -d postgres"]
+      test: ["CMD-SHELL", "pg_isready -U litellm -d litellm"]
       interval: 10s
       timeout: 5s
-      retries: 12
-    volumes:
-      - ${SPARK_AI_DATA_ROOT:-${HOME}/ai-data}/postgres:/var/lib/postgresql/data
-      - ${SPARK_AI_DATA_ROOT:-${HOME}/ai-data}/state/postgres-init.sql:/docker-entrypoint-initdb.d/01-create-databases.sql:ro
-    ports:
-      - "127.0.0.1:5432:5432"
-    logging:
-      driver: local
-      options:
-        max-size: "10m"
-        max-file: "3"
+      retries: 5
+      start_period: 10s
     security_opt:
       - no-new-privileges:true
 
   litellm:
     image: ghcr.io/berriai/litellm:v1.86.2@sha256:c0fded5fc397836c9f75220f3a3cacf8dca1525be8b474b068233afd3fe6e8f1
     container_name: spark-ai-litellm
-    network_mode: host
     restart: unless-stopped
     env_file:
-      - ${SPARK_AI_DATA_ROOT:-${HOME}/ai-data}/state/litellm.env
-    environment:
-      LITELLM_LOG: INFO
-    volumes:
-      - ${SPARK_AI_DATA_ROOT:-${HOME}/ai-data}/state/litellm-config.yaml:/app/config.yaml:ro
+      - /etc/spark-ai-stack/env.d/litellm.env
     command:
       - --config
-      - /app/config.yaml
+      - /config/litellm-config.yaml
       - --host
-      - 127.0.0.1
+      - "0.0.0.0"
       - --port
       - "4000"
+    ports:
+      - "127.0.0.1:4000:4000"
+    volumes:
+      - /run/spark-ai-stack/litellm-config.yaml:/config/litellm-config.yaml:ro
+    # Backend model slots are published on the HOST's loopback (127.0.0.1:800x),
+    # not on the compose network — litellm must reach them via the host gateway.
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    depends_on:
+      postgres:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:4000/health/readiness"]
+      interval: 15s
+      timeout: 5s
+      retries: 10
+      start_period: 30s
+    security_opt:
+      - no-new-privileges:true
+
+  openwebui:
+    image: ghcr.io/open-webui/open-webui:main
+    container_name: spark-ai-openwebui
+    restart: unless-stopped
+    env_file:
+      - /etc/spark-ai-stack/env.d/openwebui.env
+    environment:
+      # Non-secret settings only — secrets (WEBUI_SECRET_KEY, OPENAI_API_KEY) come
+      # from env.d/openwebui.env per docs/CONTRACTS.md §6.
+      WEBUI_URL: http://127.0.0.1:3000  # override in env.d/openwebui.env for the tailnet URL
+      # Not explicitly listed in CONTRACTS.md but required for OpenWebUI to actually
+      # route chat completions at the litellm gateway instead of api.openai.com.
+      OPENAI_API_BASE_URL: http://litellm:4000/v1
+      ENABLE_WEB_SEARCH: "true"
+      SEARXNG_QUERY_URL: http://searxng:8080/search?q=<query>&format=json
+      # DATABASE_URL intentionally left unset: OpenWebUI defaults to its own sqlite
+      # db under /app/backend/data. Postgres is reserved for litellm for now — see
+      # docs/CONTRACTS.md §4 (simpler; can be revisited later).
+    volumes:
+      - spark-ai-openwebui:/app/backend/data
+    ports:
+      - "127.0.0.1:3000:8080"
+    depends_on:
+      - litellm
     security_opt:
       - no-new-privileges:true
     depends_on:
@@ -82,13 +144,13 @@ services:
     image: docker.io/searxng/searxng:2026.7.3@sha256:a27984e88335cc72263509cec1173d27e58b63dbf99b438b7faa96c6c306c0c7
     container_name: spark-ai-searxng
     restart: unless-stopped
+    env_file:
+      - /etc/spark-ai-stack/env.d/searxng.env
+    volumes:
+      # Root-owned synced copy of config/searxng-settings.yml (see docs/CONTRACTS.md §1).
+      - /etc/spark-ai-stack/compose/searxng-settings.yml:/etc/searxng/settings.yml:ro
     ports:
       - "127.0.0.1:8888:8080"
-    env_file:
-      - ${SPARK_AI_DATA_ROOT:-${HOME}/ai-data}/state/searxng.env
-    volumes:
-      - ${SPARK_AI_DATA_ROOT:-${HOME}/ai-data}/state/searxng-settings.yml:/etc/searxng/settings.yml:ro
-      - ${SPARK_AI_DATA_ROOT:-${HOME}/ai-data}/cache/searxng:/var/cache/searxng
     security_opt:
       - no-new-privileges:true
     logging:
@@ -97,26 +159,24 @@ services:
         max-size: "10m"
         max-file: "3"
 
-  vllm:
+  # ---------------------------------------------------------------------------
+  # profiles: [models] — backend skeletons. NO command:, NO ports: — both are
+  # supplied by /run/spark-ai-stack/override.yaml, rendered by spark-ai-ctl
+  # backend-start from the catalog entry (docs/CONTRACTS.md §2.4, §5).
+  # ---------------------------------------------------------------------------
+
+  vllm: &vllm-skeleton
     profiles: [models]
+    image: spark-ai/vllm:26.07-xg021
     build:
-      context: ./vllm
-      args:
-        BASE_IMAGE: nvcr.io/nvidia/vllm:26.06-py3@sha256:47539d1e9a826506a1ff4536fe507d7688d453c07fe8a2325e96bcc9556b279a
-        FASTAPI_VERSION: 0.136.3
-    image: local/spark-ai-vllm:26.06-fastapi136
+      context: ./images/vllm
     container_name: spark-ai-vllm
     restart: unless-stopped
     ipc: host
-    ports:
-      - "127.0.0.1:8001:8000"
     env_file:
-      - ${SPARK_AI_DATA_ROOT:-${HOME}/ai-data}/state/vllm.env
-    environment:
-      HF_HOME: /hf-cache
-      HF_HUB_CACHE: /hf-cache/hub
+      - /etc/spark-ai-stack/env.d/vllm.env
     volumes:
-      - ${SPARK_AI_DATA_ROOT:-${HOME}/ai-data}/huggingface:/hf-cache
+      - /home/niyam-gb10/ai-data/huggingface:/data/hf
     deploy:
       resources:
         reservations:
@@ -124,45 +184,148 @@ services:
             - driver: nvidia
               count: all
               capabilities: [gpu]
-    command:
-      - vllm
-      - serve
-      - nvidia/Qwen3.6-35B-A3B-NVFP4
-      - --revision
-      - 491c2f1ea524c639598bf8fa787a93fed5a6fbce
-      - --served-model-name
-      - qwen3.6-35b
-      - --host
-      - 0.0.0.0
-      - --port
-      - "8000"
-      - --tensor-parallel-size
-      - "1"
-      - --kv-cache-dtype
-      - fp8
-      - --calculate-kv-scales
-      - --attention-backend
-      - flashinfer
-      - --moe-backend
-      - marlin
-      - --gpu-memory-utilization
-      - "0.60"
-      - --max-model-len
-      - "262144"
-      - --max-num-seqs
-      - "4"
-      - --max-num-batched-tokens
-      - "8192"
-      - --enable-prefix-caching
-      - --reasoning-parser
-      - qwen3
-      - --enable-auto-tool-choice
-      - --tool-call-parser
-      - qwen3_coder
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 1200s  # vLLM cold-load of a large NVFP4 MoE model is slow
     security_opt:
       - no-new-privileges:true
-    logging:
-      driver: local
-      options:
-        max-size: "25m"
-        max-file: "4"
+
+  # Secondary-slot variant of the vllm skeleton: its own container so a text
+  # model (vllm, slot primary) and e.g. a vision model (vllm, slot secondary)
+  # can run concurrently. spark-ai-ctl maps (backend, slot=secondary) to the
+  # "<backend>-secondary" service name.
+  vllm-secondary:
+    <<: *vllm-skeleton
+    container_name: spark-ai-vllm-secondary
+
+  llamacpp: &llamacpp-skeleton
+    profiles: [models]
+    image: spark-ai/llamacpp:f9e832c
+    build:
+      context: ./images/llamacpp
+    container_name: spark-ai-llamacpp
+    restart: unless-stopped
+    ipc: host
+    env_file:
+      - /etc/spark-ai-stack/env.d/llamacpp.env
+    volumes:
+      - /home/niyam-gb10/ai-data/models/gguf:/models/gguf:ro
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8080/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 600s  # large local GGUF w/ CPU+GPU offload can take a while
+    security_opt:
+      - no-new-privileges:true
+
+  llamacpp-secondary:
+    <<: *llamacpp-skeleton
+    container_name: spark-ai-llamacpp-secondary
+
+  sglang:
+    profiles: [models]
+    # Not built here — pinned by tag/digest in config/versions.lock.yaml. Currently
+    # digest: null (never pulled from this repo's stack yet) — see
+    # compose/images/sglang/README.md for the bump procedure.
+    image: lmsysorg/sglang:spark
+    container_name: spark-ai-sglang
+    restart: unless-stopped
+    ipc: host
+    env_file:
+      - /etc/spark-ai-stack/env.d/sglang.env
+    volumes:
+      - /home/niyam-gb10/ai-data/huggingface:/data/hf
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:30000/health_generate"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 900s
+    security_opt:
+      - no-new-privileges:true
+
+  # ---------------------------------------------------------------------------
+  # profiles: [utilities]
+  # ---------------------------------------------------------------------------
+
+  embeddings:
+    profiles: [utilities]
+    # Reuses the llamacpp image (same llama-server binary) running in embedding
+    # mode. Unlike the models-profile backends, this command is static because
+    # embeddings is a fixed, always-on utility rather than a hot-swappable slot.
+    image: spark-ai/llamacpp:f9e832c
+    container_name: spark-ai-embeddings
+    restart: unless-stopped
+    volumes:
+      - /home/niyam-gb10/ai-data/models/gguf:/models/gguf:ro
+    ports:
+      - "127.0.0.1:8011:8080"
+    command:
+      - --embedding
+      # NOTE: /models/gguf/embeddings.gguf is a PLACEHOLDER filename. The operator
+      # must supply an actual embedding GGUF at this path (e.g. a symlink or copy
+      # into ~/ai-data/models/gguf/embeddings.gguf) before this service will start
+      # successfully — no embedding model ships with this repo.
+      - --model
+      - /models/gguf/embeddings.gguf
+      - --host
+      - "0.0.0.0"
+      - --port
+      - "8080"
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8080/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 120s
+    security_opt:
+      - no-new-privileges:true
+
+  # whisper:
+  #   profiles: [utilities]
+  #   TODO(port 8010, see docs/CONTRACTS.md §3): no reliable aarch64 + CUDA 13
+  #   speech-to-text image is pinned yet as of 2026-08-29. Candidates to evaluate:
+  #   an upstream faster-whisper/whisper.cpp server image with a linux/arm64 +
+  #   CUDA 13 tag (none confirmed at authoring time), or a custom build under
+  #   compose/images/whisper/ following the llamacpp multi-stage pattern. Revisit
+  #   and uncomment once a base image is chosen; add the pin to
+  #   config/versions.lock.yaml at the same time.
+  #   image: TODO-pin-a-whisper-image
+  #   container_name: spark-ai-whisper
+  #   restart: unless-stopped
+  #   ports:
+  #     - "127.0.0.1:8010:9000"
+  #   deploy:
+  #     resources:
+  #       reservations:
+  #         devices:
+  #           - driver: nvidia
+  #             count: all
+  #             capabilities: [gpu]
+  #   security_opt:
+  #     - no-new-privileges:true

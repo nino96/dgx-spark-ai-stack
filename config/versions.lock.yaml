@@ -1,102 +1,167 @@
-{
-  "schema": 1,
-  "generated": "2026-08-26",
-  "sources": {
-    "ds4": {
-      "repository": "https://github.com/Entrpi/ds4.git",
-      "ref": "v0.5.2",
-      "commit": "82d2a6f7ec580d979f8352d3249ad5415a321e89"
-    },
-    "llama_cpp": {
-      "repository": "https://github.com/ggml-org/llama.cpp.git",
-      "ref": "b10289",
-      "commit": "f9e832c10e9444cb168ddcb579cc62c154f3068b"
-    }
-  },
-  "images": {
-    "litellm": {
-      "reference": "ghcr.io/berriai/litellm:v1.86.2@sha256:c0fded5fc397836c9f75220f3a3cacf8dca1525be8b474b068233afd3fe6e8f1",
-      "platform": "linux/arm64",
-      "release_index_reference": "ghcr.io/berriai/litellm:v1.86.2@sha256:cae1ac3492d6d0bea69c26f4485381624e073eb753f3534ae7703a4204a4ce6b",
-      "public_key_url": "https://raw.githubusercontent.com/BerriAI/litellm/0112e53046018d726492c814b3644b7d376029d0/cosign.pub",
-      "public_key_sha256": "ff8869bf14ba9d10af7b64b9d479543b44daec0165e715753c43ff8a998f6dd3",
-      "public_key_path": "/usr/local/share/spark-ai-stack/litellm-cosign.pub"
-    },
-    "vllm_base": {
-      "reference": "nvcr.io/nvidia/vllm:26.06-py3@sha256:47539d1e9a826506a1ff4536fe507d7688d453c07fe8a2325e96bcc9556b279a",
-      "platform": "linux/arm64",
-      "release_index_reference": "nvcr.io/nvidia/vllm:26.06-py3@sha256:6e537fc8d84beb9b60e789236168141d2ef4420bc28cbb85ec7d4318ca918b6c"
-    },
-    "searxng": {
-      "reference": "docker.io/searxng/searxng:2026.7.3@sha256:a27984e88335cc72263509cec1173d27e58b63dbf99b438b7faa96c6c306c0c7",
-      "platform": "linux/arm64",
-      "release_index_reference": "docker.io/searxng/searxng:2026.7.3@sha256:b7492e1b8fcb376191809982e6a45dc809a5d0e641d81feaa53a1fac6c599b9e"
-    },
-    "postgres": {
-      "reference": "docker.io/library/postgres:16.10@sha256:d6128f87af47b927176b6e957e6b722624f87d772afa61f3cd1e2f0e52117dcf",
-      "platform": "linux/arm64",
-      "release_index_reference": "docker.io/library/postgres:16.10@sha256:21f6013073bc6b92830a2129570e2f5ec42a6c734b5a985a41e83aa58f54c3c1"
-    },
-    "open_webui": {
-      "reference": "ghcr.io/open-webui/open-webui:v0.10.2@sha256:0d58a66704d69e52da83f72bcd43869ad4fd0c761313778bc95ef6940a0b81e3",
-      "platform": "linux/arm64",
-      "release_index_reference": "ghcr.io/open-webui/open-webui:v0.10.2@sha256:9fcea9c6e32ab60b0498f3986c6cdf651ddbe61db48d2213a3d28048ddd673d4"
-    },
-    "pihole": {
-      "reference": "docker.io/pihole/pihole:2026.07.2@sha256:a29ad980775f38a8e7524a206ff9c125bc6fcfd9de8de1fc93d2de0671cc1d34",
-      "platform": "linux/arm64",
-      "release_index_reference": "docker.io/pihole/pihole:2026.07.2@sha256:f7d1be836e3bc608b56d82fc9904f5a831cdfbc0dc9c6d58f94e4c985c70038b",
-      "optional": true
-    },
-    "adguard_home": {
-      "reference": "docker.io/adguard/adguardhome:v0.107.76@sha256:bd12e2cd483737b6b51a056bc5cc5d5d544b94f14a7aae93ce2f83943760f2ce",
-      "platform": "linux/arm64",
-      "release_index_reference": "docker.io/adguard/adguardhome:v0.107.76@sha256:7157eb1dc3b26c7af1d6898759a7b3f7d0fa09891fbd2d3caa6abc1057a9179b",
-      "optional": true
-    }
-  },
-  "tools": {
-    "cosign": {
-      "version": "3.0.6",
-      "url": "https://github.com/sigstore/cosign/releases/download/v3.0.6/cosign-linux-arm64",
-      "sha256": "bedac92e8c3729864e13d4a17048007cfafa79d5deca993a43a90ffe018ef2b8"
-    }
-  },
-  "python": {
-    "fastapi_workaround": "0.136.3",
-    "ansible_core": "2.18.7",
-    "huggingface_hub": "0.36.0"
-  },
-  "models": {
-    "nvidia_qwen": {
-      "repository": "nvidia/Qwen3.6-35B-A3B-NVFP4",
-      "revision": "491c2f1ea524c639598bf8fa787a93fed5a6fbce"
-    },
-    "unsloth_qwen_candidate": {
-      "repository": "unsloth/Qwen3.6-35B-A3B-NVFP4-Fast",
-      "revision": "1c3f884bc99aac2524f6d49bcbac8c88401afd66",
-      "enabled": false
-    },
-    "qwen_gguf": {
-      "repository": "bartowski/Qwen_Qwen3.5-4B-GGUF",
-      "revision": "4168f45a16a1290d65a4ec0fa312ae917a4c15d6",
-      "filename": "Qwen_Qwen3.5-4B-Q4_K_M.gguf",
-      "size": 3013027808,
-      "sha256": "13c16f426047e2de38cd075bdade4a7bcbc8c774384876f677740cda65f8a983"
-    },
-    "ds4_base": {
-      "repository": "antirez/deepseek-v4-gguf",
-      "revision": "e7f04037032990db0346398d249baf9fb9df1ccc",
-      "filename": "DeepSeek-V4-Flash-IQ2XXS-w2Q2K-AProjQ8-SExpQ8-OutQ8-chat-v2-imatrix-0731.gguf",
-      "size": 86720111488,
-      "sha256": "ca22ae2f838e14077c22bc1c1417b71b45b5e5a3687bd96c2ac6e17fdb6261c0"
-    },
-    "ds4_drafter": {
-      "repository": "bleysg/DeepSeek-V4-Flash-DSpark-drafter-GGUF",
-      "revision": "81c6fdd38f9582da45ba27f0ed7b63bcd3ea3b62",
-      "filename": "DSpark-drafter-Q2K-Q8-0731.gguf",
-      "size": 6971241504,
-      "sha256": "8fa269560dc76fd73e4233ad9b1938b5f65dd363381fd9b1a5c6183f7d12d686"
-    }
-  }
-}
+# Image + source pin lockfile for spark-ai-stack.
+#
+# Pin/bump procedure (one line): edit the pin here, rebuild the affected image (or
+# `docker pull` for an upstream-only pin), run the sanity + acceptance suite, then
+# commit this file alongside whatever change required the bump.
+#
+# Rewritten from the old schema-1 JSON-in-YAML lockfile as real YAML. Everything
+# ansible/cosign-related has been dropped (no ansible or image-signature verification
+# in the refactored stack). `digest: null` means "pin on first pull" — either the old
+# lockfile never recorded a digest for this artifact, or this repo moved to a newer
+# tag than the old lockfile pinned.
+
+schema_version: 2
+
+images:
+  litellm:
+    repository: ghcr.io/berriai/litellm
+    tag: v1.86.2
+    digest: sha256:c0fded5fc397836c9f75220f3a3cacf8dca1525be8b474b068233afd3fe6e8f1
+    platform: linux/arm64
+    notes: >
+      Carried from the schema-1 lockfile — still the pin used by compose/compose.yml's
+      litellm service. Bump by choosing a newer released version at implementation
+      time (docs/CONTRACTS.md §4 leaves the version choice open).
+
+  vllm_base:
+    repository: nvcr.io/nvidia/vllm
+    tag: 26.07-py3
+    digest: null  # pin on first `docker pull` of this tag
+    platform: linux/arm64
+    notes: >
+      The old lockfile only ever pinned 26.06-py3
+      (sha256:47539d1e9a826506a1ff4536fe507d7688d453c07fe8a2325e96bcc9556b279a). This
+      repo moves to 26.07-py3 per docs/CONTRACTS.md §4 and
+      docs/legacy/vllm-playbook/{Dockerfile.vllm-26.07-xgrammar-fix,build-vllm.sh,
+      start-vllm.sh} — the known-good lineage currently running in production on this
+      box. No 26.07-py3 digest exists anywhere in this repo's history yet.
+    build:
+      dockerfile: compose/images/vllm/Dockerfile
+      image_tag: spark-ai/vllm:26.07-xg021
+      pins:
+        apache-tvm-ffi: "0.1.9"
+        xgrammar: "0.2.1"
+
+  llamacpp:
+    # Runtime image built from compose/images/llamacpp/Dockerfile — see `sources.llama_cpp`
+    # below for the pinned git commit and `builder_base`/`runtime_base` for the CUDA
+    # images the Dockerfile builds/runs on.
+    builder_base:
+      repository: nvidia/cuda
+      tag: 13.0.1-devel-ubuntu24.04
+      digest: null  # NEEDS-PIN: verify this exact linux/arm64 tag exists before relying on it
+      platform: linux/arm64
+      notes: >
+        Registry access was not available while writing this lockfile. Host driver
+        reports CUDA 13.0.3 (see /usr/local/cuda/version.json on this box) — a 13.0.x
+        devel image is expected to be compatible but the exact published tag is
+        unverified. Confirm the tag resolves, then fill in the digest.
+    runtime_base:
+      repository: nvidia/cuda
+      tag: 13.0.1-runtime-ubuntu24.04
+      digest: null  # NEEDS-PIN, same caveat as builder_base
+      platform: linux/arm64
+    build:
+      dockerfile: compose/images/llamacpp/Dockerfile
+      image_tag: spark-ai/llamacpp:f9e832c  # short form of sources.llama_cpp.commit
+      cmake_flags:
+        - -DGGML_CUDA=ON
+        - -DGGML_CUDA_F16=ON
+        - -DCMAKE_CUDA_ARCHITECTURES=121
+        - -DGGML_NATIVE=OFF
+        - -DGGML_CUDA_FA=ON
+        - -DGGML_CUDA_GRAPHS=ON
+        - -DGGML_CPU_REPACK=ON
+        - -DGGML_SCHED_MAX_COPIES=4
+      notes: >
+        -DGGML_CUDA_F16=ON and -DCMAKE_CUDA_ARCHITECTURES=121 are mandated verbatim by
+        docs/CONTRACTS.md §4. GGML_CUDA_F16 no longer exists as a cmake option in the
+        pinned llama.cpp commit (confirmed against the local ~/llama.cpp-qwen4exp
+        checkout on this box, which shares the same ggml-cuda backend code) — cmake
+        will warn and ignore it; harmless but worth flagging for a future CONTRACTS.md
+        update. CMAKE_CUDA_ARCHITECTURES=121 vs. the "121a-real" that llama.cpp's own
+        native-detection logic would choose for this GPU (GB10, sm_121, Blackwell) is
+        also a CONTRACTS.md wording note, not a build blocker — see the compose/images
+        report for detail. The remaining flags
+        (GGML_CUDA_FA/GGML_CUDA_GRAPHS/GGML_CPU_REPACK/GGML_SCHED_MAX_COPIES=4) match
+        both ~/llama.cpp-qwen4exp/build/CMakeCache.txt on this box AND the
+        ggml/CMakeLists.txt defaults for this llama.cpp version — set explicitly here
+        for pinning/clarity rather than because they differ from default.
+
+  sglang:
+    repository: lmsysorg/sglang
+    tag: spark
+    digest: null  # pin on first pull — never pulled/verified from this repo's stack yet
+    platform: linux/arm64
+    notes: experimental-tier backend per docs/CONTRACTS.md §4/§7. See compose/images/sglang/README.md.
+
+  openwebui:
+    repository: ghcr.io/open-webui/open-webui
+    tag: main  # NEEDS-PIN: pick a released version tag instead of the moving `main` tag
+    digest: null
+    platform: linux/arm64
+
+  postgres:
+    repository: postgres
+    tag: "17"
+    digest: null  # pin on first pull (official arm64 multi-arch manifest)
+    platform: linux/arm64
+
+  searxng:
+    repository: docker.io/searxng/searxng
+    tag: 2026.7.3
+    digest: sha256:a27984e88335cc72263509cec1173d27e58b63dbf99b438b7faa96c6c306c0c7
+    platform: linux/arm64
+    notes: carried from the schema-1 lockfile.
+
+sources:
+  # Git sources built into images above, or built natively outside compose
+  # (config/experimental.yaml's ds4 backend — kept here for continuity since this
+  # lockfile is the one place all version pins live, even though ds4 itself is out
+  # of workstream C's compose-file scope per docs/CONTRACTS.md §12).
+  llama_cpp:
+    repository: https://github.com/ggml-org/llama.cpp.git
+    ref: b10289
+    commit: f9e832c10e9444cb168ddcb579cc62c154f3068b
+    notes: >
+      Carried from the schema-1 lockfile (still upstream ggml-org, not the local
+      ~/llama.cpp-qwen4exp fork on this box, which is an unpublished experimental
+      branch with out-of-tree qwen4exp changes and cannot be `git clone`d by the
+      Dockerfile). Verify b10289 still configures/builds cleanly before relying on
+      it in production; bump to a newer upstream release tag (updating this entry
+      and compose/images/llamacpp/Dockerfile's image_tag together) if it doesn't.
+  ds4:
+    repository: https://github.com/Entrpi/ds4.git
+    ref: v0.5.2
+    commit: 82d2a6f7ec580d979f8352d3249ad5415a321e89
+    notes: >
+      Not part of the compose stack (config/experimental.yaml, own systemd unit
+      per docs/CONTRACTS.md §7) — carried here unchanged so this repo doesn't lose
+      the pin during the schema-1 -> schema-2 lockfile rewrite.
+
+models:
+  # Carried verbatim from the schema-1 lockfile. config/models.yaml (workstream A)
+  # is the authoritative model catalog for the compose/modelctl stack; these entries
+  # exist here only as a pin-history record for the exact artifacts that were
+  # validated against this repo's known-good vLLM/llama.cpp images.
+  nvidia_qwen:
+    repository: nvidia/Qwen3.6-35B-A3B-NVFP4
+    revision: 491c2f1ea524c639598bf8fa787a93fed5a6fbce
+  qwen_gguf:
+    repository: bartowski/Qwen_Qwen3.5-4B-GGUF
+    revision: 4168f45a16a1290d65a4ec0fa312ae917a4c15d6
+    filename: Qwen_Qwen3.5-4B-Q4_K_M.gguf
+    size: 3013027808
+    sha256: 13c16f426047e2de38cd075bdade4a7bcbc8c774384876f677740cda65f8a983
+  ds4_base:
+    repository: antirez/deepseek-v4-gguf
+    revision: e7f04037032990db0346398d249baf9fb9df1ccc
+    filename: DeepSeek-V4-Flash-IQ2XXS-w2Q2K-AProjQ8-SExpQ8-OutQ8-chat-v2-imatrix-0731.gguf
+    size: 86720111488
+    sha256: ca22ae2f838e14077c22bc1c1417b71b45b5e5a3687bd96c2ac6e17fdb6261c0
+  ds4_drafter:
+    repository: bleysg/DeepSeek-V4-Flash-DSpark-drafter-GGUF
+    revision: 81c6fdd38f9582da45ba27f0ed7b63bcd3ea3b62
+    filename: DSpark-drafter-Q2K-Q8-0731.gguf
+    size: 6971241504
+    sha256: 8fa269560dc76fd73e4233ad9b1938b5f65dd363381fd9b1a5c6183f7d12d686

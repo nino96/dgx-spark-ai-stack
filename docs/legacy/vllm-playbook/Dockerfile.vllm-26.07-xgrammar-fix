@@ -1,0 +1,11 @@
+ARG BASE_IMAGE=nvcr.io/nvidia/vllm:26.07-py3
+FROM ${BASE_IMAGE}
+
+# NVIDIA's 26.07 vLLM code imports normalize_tool_choice, which was first
+# exported by xgrammar 0.2.1. The base image also ships apache-tvm-ffi 0.1.7
+# even though both vLLM and xgrammar require 0.1.9.
+RUN python3 -m pip install --no-cache-dir --no-deps \
+    "apache-tvm-ffi==0.1.9" \
+    "xgrammar==0.2.1"
+
+RUN python3 -c "from xgrammar import StructuralTag, normalize_tool_choice; print('xgrammar tool-choice API: OK')"

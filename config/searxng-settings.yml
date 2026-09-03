@@ -1,0 +1,30 @@
+# Synced (root-owned, read-only) to /etc/spark-ai-stack/compose/searxng-settings.yml by
+# `sudo spark-ai-ctl sync` and mounted into the searxng container at
+# /etc/searxng/settings.yml (see compose/compose.yml `searxng` service).
+#
+# Based on the legacy live instance (~/Documents/searxng/settings.yml) that this repo
+# replaces — same use_default_settings/server/search shape, kept so the t640 litellm's
+# SearXNG URL change is path-only (docs/CONTRACTS.md §3, §8: port 8888 kept from legacy).
+
+use_default_settings: true
+
+server:
+  # SearXNG supports overriding this from the SEARXNG_SECRET environment variable at
+  # container startup regardless of the value written here — the real secret lives in
+  # /etc/spark-ai-stack/env.d/searxng.env (docs/CONTRACTS.md §6), never in this
+  # user-writable repo file. This placeholder is never used as-is.
+  secret_key: "overridden-at-runtime-by-SEARXNG_SECRET-env-do-not-use-this-value"
+  bind_address: "0.0.0.0"
+  port: 8080
+  public_instance: false
+  image_proxy: false
+  method: GET
+  # Private loopback + tailnet single-user instance, not internet-facing — the
+  # bot-detection/rate-limiter exists for public instances and would just add
+  # friction (CAPTCHAs) here.
+  limiter: false
+
+search:
+  formats:
+    - html
+    - json  # required: the t640's litellm instance consumes SearXNG via format=json

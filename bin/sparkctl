@@ -1,0 +1,221 @@
+#!/usr/bin/env bash
+# Thin user-facing wrapper around the privileged spark-ai-ctl tool, bin/doctor,
+# and tests/acceptance.py. See docs/CONTRACTS.md §9.
+#
+# `core|monitoring|utilities|status` verbs are NOPASSWD sudoers entries (per
+# §5) so plain `sudo` here will not actually prompt once bootstrap has run --
+# it is used (not `sudo -n`) because a human is expected to be at the
+# terminal. `sync` and `secrets` are password-gated on purpose (§5): they are
+# NOT NOPASSWD, so `sudo` legitimately prompts for those.
+set -euo pipefail
+
+ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
+
+usage() {
+    cat <<'EOF'
+Usage: bin/sparkctl COMMAND [options]
+
+Commands:
+  bootstrap                     sudo ./bootstrap.sh [args...]
+  sync                          sudo spark-ai-ctl sync (password required; prints a diff first)
+  secrets init|status|rotate KEY
+  core up|down|restart|status
+  monitoring up|down
+  utilities up|down
+  tailscale-configure [--yes]   apply the docs/CONTRACTS.md §8 Serve map (dry-run without --yes)
+  doctor [...]                  exec bin/doctor
+  acceptance [...]              python3 tests/acceptance.py
+  migrate                       adopt pre-cutover legacy artifacts (gguf files, vllm-hf-cache)
+EOF
+}
+
+command="${1:-}"
+[[ -n "$command" ]] || { usage; exit 2; }
+shift
+
+case "$command" in
+    bootstrap)
+        exec sudo "$ROOT/bootstrap.sh" "$@"
+        ;;
+    sync)
+        [[ $# -eq 0 ]] || { usage; exit 2; }
+        exec sudo spark-ai-ctl sync
+        ;;
+    secrets)
+        sub="${1:-}"
+        [[ -n "$sub" ]] || { usage; exit 2; }
+        shift
+        case "$sub" in
+            init) exec sudo spark-ai-ctl secrets-init ;;
+            status) exec sudo spark-ai-ctl secrets-status ;;
+            rotate)
+                key="${1:-}"
+                [[ -n "$key" ]] || { echo "sparkctl: secrets rotate requires a KEY" >&2; exit 2; }
+                exec sudo spark-ai-ctl secrets-rotate "$key"
+                ;;
+            *) echo "sparkctl: unknown secrets subcommand: $sub" >&2; usage >&2; exit 2 ;;
+        esac
+        ;;
+    core)
+        sub="${1:-}"
+        [[ -n "$sub" ]] || { usage; exit 2; }
+        shift
+        case "$sub" in
+            up) exec sudo spark-ai-ctl core-up ;;
+            down) exec sudo spark-ai-ctl core-down ;;
+            restart) exec sudo spark-ai-ctl core-restart ;;
+            status) exec sudo spark-ai-ctl core-ps ;;
+            *) echo "sparkctl: unknown core subcommand: $sub" >&2; usage >&2; exit 2 ;;
+        esac
+        ;;
+    monitoring)
+        sub="${1:-}"
+        [[ -n "$sub" ]] || { usage; exit 2; }
+        shift
+        case "$sub" in
+            up) exec sudo spark-ai-ctl monitoring-up ;;
+            down) exec sudo spark-ai-ctl monitoring-down ;;
+            *) echo "sparkctl: unknown monitoring subcommand: $sub" >&2; usage >&2; exit 2 ;;
+        esac
+        ;;
+    utilities)
+        sub="${1:-}"
+        [[ -n "$sub" ]] || { usage; exit 2; }
+        shift
+        case "$sub" in
+            up) exec sudo spark-ai-ctl utilities-up ;;
+            down) exec sudo spark-ai-ctl utilities-down ;;
+            *) echo "sparkctl: unknown utilities subcommand: $sub" >&2; usage >&2; exit 2 ;;
+        esac
+        ;;
+    doctor)
+        exec "$ROOT/bin/doctor" "$@"
+        ;;
+    acceptance)
+        exec python3 "$ROOT/tests/acceptance.py" "$@"
+        ;;
+    tailscale-configure)
+        apply=0
+        for argument in "$@"; do
+            case "$argument" in
+                --yes) apply=1 ;;
+                *) echo "sparkctl: unknown tailscale-configure option: $argument" >&2; exit 2 ;;
+            esac
+        done
+        tailscale status >/dev/null
+
+        maybe_run() {
+            if [[ "$apply" -eq 1 ]]; then
+                echo "+ $*"
+                "$@"
+            else
+                echo "[dry-run] $*"
+            fi
+        }
+
+        # Idempotent: reset the whole Serve config, then re-add every mount
+        # from docs/CONTRACTS.md §8. No Funnel is ever enabled.
+        maybe_run tailscale serve reset
+        maybe_run tailscale serve --yes --bg --set-path=/ http://127.0.0.1:3000
+        maybe_run tailscale serve --yes --bg --set-path=/v1 http://127.0.0.1:4000/v1
+        maybe_run tailscale serve --yes --bg --set-path=/search http://127.0.0.1:8888/search
+        if curl --silent --fail --max-time 1 http://127.0.0.1:3001/ >/dev/null 2>&1; then
+            maybe_run tailscale serve --yes --bg --set-path=/grafana http://127.0.0.1:3001/grafana
+        else
+            echo "# grafana not reachable on 127.0.0.1:3001; skipping /grafana mount (bring monitoring up first)"
+        fi
+        if [[ "$apply" -eq 1 ]]; then
+            tailscale serve status
+        else
+            echo "Dry run only; re-run with --yes to apply."
+        fi
+        ;;
+    migrate)
+        [[ $# -eq 0 ]] || { usage; exit 2; }
+        DATA_ROOT="${SPARK_AI_DATA_ROOT:-$HOME/ai-data}"
+        mkdir -p "$DATA_ROOT/models/gguf" "$DATA_ROOT/huggingface"
+
+        # config/models.yaml + config/experimental.yaml are the source of truth
+        # for which local gguf files exist and what they must hash to.
+        python3 - "$ROOT" "$DATA_ROOT" <<'PY'
+import sys
+from pathlib import Path
+import yaml
+
+root, data_root = Path(sys.argv[1]), Path(sys.argv[2])
+entries = []
+for name in ("models.yaml", "experimental.yaml"):
+    doc = yaml.safe_load((root / "config" / name).read_text()) or {}
+    for model_name, spec in (doc.get("models") or {}).items():
+        source = spec.get("source", {})
+        if "local_path" in source:
+            entries.append((model_name, source))
+            if source.get("drafter"):
+                entries.append((f"{model_name} (drafter)", source["drafter"]))
+
+for model_name, source in entries:
+    print(f"{model_name}\t{source['local_path']}\t{source['filename']}\t{source['sha256']}")
+PY
+        echo "^ that is the catalog of local gguf artifacts modelctl expects."
+        echo
+        echo "Hard-linking from ~/gguf (skip files already adopted or not present yet):"
+        while IFS=$'\t' read -r model_name local_path filename expected_sha; do
+            target="$(eval echo "$local_path")"
+            source="$HOME/gguf/$filename"
+            if [[ -e "$target" ]]; then
+                actual="$(sha256sum "$target" | awk '{print $1}')"
+                if [[ "$actual" == "$expected_sha" ]]; then
+                    echo "already adopted + verified: $target"
+                else
+                    echo "sparkctl: $target exists with the WRONG checksum ($actual != $expected_sha)" >&2
+                fi
+                continue
+            fi
+            if [[ ! -f "$source" ]]; then
+                echo "not present yet, skipping: $source (fetch later with modelctl fetch)"
+                continue
+            fi
+            if ln -- "$source" "$target" 2>/dev/null; then
+                echo "hard-linked: $source -> $target"
+            else
+                cp --sparse=always -- "$source" "$target"
+                echo "copied: $source -> $target"
+            fi
+            actual="$(sha256sum "$target" | awk '{print $1}')"
+            [[ "$actual" == "$expected_sha" ]] || echo "sparkctl: checksum mismatch after adoption: $target" >&2
+        done < <(python3 - "$ROOT" "$DATA_ROOT" <<'PY'
+import sys
+from pathlib import Path
+import yaml
+
+root, _data_root = Path(sys.argv[1]), Path(sys.argv[2])
+for name in ("models.yaml", "experimental.yaml"):
+    doc = yaml.safe_load((root / "config" / name).read_text()) or {}
+    for model_name, spec in (doc.get("models") or {}).items():
+        source = spec.get("source", {})
+        if "local_path" in source:
+            print(f"{model_name}\t{source['local_path']}\t{source['filename']}\t{source['sha256']}")
+            drafter = source.get("drafter")
+            if drafter:
+                print(f"{model_name}-drafter\t{drafter['local_path']}\t{drafter['filename']}\t{drafter['sha256']}")
+PY
+)
+
+        echo
+        echo "Copying docker volume vllm-hf-cache into $DATA_ROOT/huggingface (pre-hardening step;"
+        echo "uses sudo docker directly, not the spark-ai-ctl wrapper -- this is a one-time,"
+        echo "documented exception run before the operator user loses docker group access)."
+        if sudo docker volume inspect vllm-hf-cache >/dev/null 2>&1; then
+            sudo docker run --rm \
+                -v vllm-hf-cache:/src:ro \
+                -v "$DATA_ROOT/huggingface":/dst \
+                alpine cp -a /src/. /dst/
+            echo "copied vllm-hf-cache -> $DATA_ROOT/huggingface (source volume retained)"
+        else
+            echo "docker volume vllm-hf-cache not found; nothing to copy"
+        fi
+        echo "Migration complete. No legacy files, volumes, images, or containers were removed."
+        ;;
+    help|-h|--help) usage ;;
+    *) echo "sparkctl: unknown command: $command" >&2; usage >&2; exit 2 ;;
+esac

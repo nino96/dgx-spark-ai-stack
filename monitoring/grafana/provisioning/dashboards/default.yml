@@ -1,0 +1,18 @@
+# Grafana dashboard provisioning. Synced by `sudo sparkctl sync` to
+# /etc/spark-ai-stack/compose/grafana/provisioning/dashboards/default.yml and
+# mounted read-only into the grafana container at
+# /etc/grafana/provisioning/dashboards/default.yml. Points at the dashboard
+# JSON mounted from monitoring/grafana/dashboards/ (see compose/monitoring.yml).
+apiVersion: 1
+
+providers:
+  - name: gb10-stack
+    orgId: 1
+    folder: ""
+    type: file
+    disableDeletion: false
+    updateIntervalSeconds: 30
+    allowUiUpdates: false
+    options:
+      path: /var/lib/grafana/dashboards
+      foldersFromFilesStructure: false

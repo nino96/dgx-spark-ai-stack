@@ -1,15 +1,18 @@
-.ansible/
 .env
-*.retry
 __pycache__/
 *.py[cod]
+*.pyc
 .pytest_cache/
 .ruff_cache/
 .venv/
 coverage.xml
+
+# Secrets and orchestration state must never be committed. The real secrets
+# file lives root-owned at /etc/spark-ai-stack/secrets.env, never in the repo.
 secrets.env
-dns.env
+*.secrets.env
 state/
+
 models/
 *.gguf
 *.safetensors
